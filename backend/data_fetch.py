@@ -22,6 +22,21 @@ def validate_ticker_symbol(symbol: str) -> bool:
     return bool(symbol) and bool(re.match(r"^[A-Z0-9.\-^]+$", symbol))
 
 
+def _flatten_yfinance_news_item(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    yfinance often returns nested `content: {title, summary, ...}` instead of top-level keys.
+    Copy title/summary up so sentiment and display logic can use a single shape.
+    """
+    out = dict(raw)
+    c = raw.get("content")
+    if isinstance(c, dict):
+        if not out.get("title"):
+            out["title"] = c.get("title") or ""
+        if not out.get("summary"):
+            out["summary"] = c.get("summary") or ""
+    return out
+
+
 @dataclass
 class FetchedStockData:
     ticker: str
@@ -60,7 +75,7 @@ def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockDat
         if raw_news is None:
             raw_news = []
         if isinstance(raw_news, list):
-            news = raw_news
+            news = [_flatten_yfinance_news_item(x) for x in raw_news if isinstance(x, dict)]
     except Exception:
         news = []
 

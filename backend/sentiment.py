@@ -31,7 +31,12 @@ class SentimentSnapshot:
 
 
 def _extract_title(item: dict[str, Any]) -> str:
-    return str(item.get("title") or item.get("Title") or "")
+    t = item.get("title") or item.get("Title")
+    if not t:
+        c = item.get("content")
+        if isinstance(c, dict):
+            t = c.get("title")
+    return str(t or "")
 
 
 def analyze_news_sentiment(
@@ -54,6 +59,10 @@ def analyze_news_sentiment(
         if title:
             texts.append(title)
         summary = n.get("summary") or n.get("Summary")
+        if not summary:
+            c = n.get("content")
+            if isinstance(c, dict):
+                summary = c.get("summary")
         if summary and isinstance(summary, str) and len(summary) < 400:
             texts.append(summary[:300])
 
