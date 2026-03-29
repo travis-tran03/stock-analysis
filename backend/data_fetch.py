@@ -45,7 +45,7 @@ def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockDat
     if hist.empty:
         raise ValueError(f"No price history for {ticker}")
 
-    # Normalize column names to lowercase for consistency with pandas_ta
+    # Normalize column names to lowercase for technical analysis
     hist.columns = [str(c).lower() for c in hist.columns]
 
     info: dict[str, Any] = {}

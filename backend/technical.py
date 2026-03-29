@@ -1,4 +1,7 @@
-"""Technical indicators: RSI, MACD, MAs, ATR, pivots, support/resistance."""
+"""Technical indicators: RSI, MACD, MAs, ATR, pivots, support/resistance.
+
+Implemented with pandas/numpy only (no pandas-ta/numba) so installs work on Python 3.14+.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +10,6 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 
 @dataclass
@@ -26,6 +28,41 @@ class TechnicalSnapshot:
     support: Optional[float]
     resistance: Optional[float]
     raw_row: dict[str, Any]
+
+
+def _rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
+    """RSI using Wilder smoothing (matches common TA libraries)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.finfo(float).eps)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD line, signal, histogram (12/26/9)."""
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def _atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    """Average True Range (Wilder)."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
 
 
 def _last_valid(series: Optional[pd.Series]) -> Optional[float]:
@@ -67,24 +104,16 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
     high = df["high"]
     low = df["low"]
 
-    rsi_series = ta.rsi(close, length=14)
-    macd_df = ta.macd(close)
-    sma50 = ta.sma(close, length=50)
-    sma200 = ta.sma(close, length=200)
-    atr_series = ta.atr(high, low, close, length=14)
+    rsi_series = _rsi_wilder(close, 14)
+    macd_line, signal_line, hist = _macd(close)
+    sma50 = close.rolling(window=50, min_periods=50).mean()
+    sma200 = close.rolling(window=200, min_periods=200).mean()
+    atr_series = _atr_wilder(high, low, close, 14)
 
     rsi_14 = _last_valid(rsi_series)
-    macd_val = macd_sig = macd_hist = None
-    if macd_df is not None and not macd_df.empty:
-        # Typical columns: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-        cols = list(macd_df.columns)
-        for c in cols:
-            if c.startswith("MACD_") and "MACDh" not in c and "MACDs" not in c:
-                macd_val = _last_valid(macd_df[c])
-            elif c.startswith("MACDs_"):
-                macd_sig = _last_valid(macd_df[c])
-            elif c.startswith("MACDh_"):
-                macd_hist = _last_valid(macd_df[c])
+    macd_val = _last_valid(macd_line)
+    macd_sig = _last_valid(signal_line)
+    macd_hist = _last_valid(hist)
 
     sma_50 = _last_valid(sma50)
     sma_200 = _last_valid(sma200)
