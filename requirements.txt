@@ -6,7 +6,6 @@ pandas>=2.1.0
 numpy>=1.26.0
 pandas-ta>=0.3.14b
 textblob>=0.18.0
-httpx>=0.26.0
 pydantic>=2.5.0
 python-multipart>=0.0.6
 feedparser>=6.0.10
