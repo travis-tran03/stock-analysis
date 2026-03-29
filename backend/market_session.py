@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Optional
 
@@ -20,6 +21,47 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _json_safe_scalar(x: Any) -> Any:
+    """Plain Python floats/ints for Pydantic JSON and Streamlit; drop NaN/Inf."""
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int,)):
+        return x
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(x, str):
+        return x
+    try:
+        if hasattr(x, "item"):
+            v = x.item()
+            return _json_safe_scalar(v)
+    except Exception:
+        pass
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def sanitize_market_dict(d: dict[str, Any]) -> dict[str, Any]:
+    """Ensure JSON-safe snapshot (fixes empty Market tab with numpy types / dropped keys)."""
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if k == "error":
+            if v:
+                out["fetch_error"] = str(v)
+            continue
+        out[k] = _json_safe_scalar(v)
+    return out
 
 
 def get_market_snapshot() -> dict[str, Any]:
@@ -102,6 +144,7 @@ def get_market_snapshot() -> dict[str, Any]:
 
     spy_s = float(out["spy_score"])
     out["market_score"] = float(max(-1.0, min(1.0, spy_s + vix_adj)))
+    out = sanitize_market_dict(out)
     _market_cache = (now, out)
     return out
 

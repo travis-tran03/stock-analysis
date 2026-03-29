@@ -231,7 +231,7 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
             "session": es,
             "combined": comb,
         },
-        "market": {k: v for k, v in market.items() if k != "error"},
+        "market": market,
         "extended_session": sess,
     }
 
