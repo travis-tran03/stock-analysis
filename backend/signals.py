@@ -55,15 +55,56 @@ def _confidence_from_score(s: float, has_fundamentals: bool, news_count: int) ->
     return float(max(0.1, min(0.95, base)))
 
 
+def _entry_market_adjustment(
+    market_score: float,
+    vix_last: Optional[float],
+    atr: Optional[float],
+    price: float,
+) -> tuple[float, float]:
+    """
+    Scale ATR-based bands with tape + vol; add extra room *below* last for long-leaning zones.
+
+    Returns:
+        band_mult: multiply effective ATR (widen ranges in risk-off / high VIX / volatile names).
+        low_extra_frac: additional fraction of scaled ATR to extend the low side (dip / flush room).
+    """
+    base_a = atr if atr and atr > 0 else price * 0.02
+    atr_pct = (base_a / price) if price > 0 else 0.02
+
+    band_mult = 1.0
+    if vix_last is not None and vix_last > 18:
+        band_mult += min(0.3, (vix_last - 18) * 0.012)
+    if market_score < 0:
+        band_mult += min(0.28, abs(market_score) * 0.55)
+    if atr_pct > 0.028:
+        band_mult += min(0.22, (atr_pct - 0.028) * 5.0)
+    band_mult = max(1.0, min(1.85, band_mult))
+
+    low_extra_frac = 0.0
+    if market_score < 0:
+        low_extra_frac += min(0.38, abs(market_score) * 0.65)
+    if vix_last is not None and vix_last > 20:
+        low_extra_frac += min(0.22, (vix_last - 20) * 0.016)
+    if atr_pct > 0.038:
+        low_extra_frac += min(0.2, (atr_pct - 0.038) * 4.0)
+    low_extra_frac = min(0.7, low_extra_frac)
+
+    return band_mult, low_extra_frac
+
+
 def _levels_buy(
     price: float,
     atr: Optional[float],
     support: Optional[float],
     resistance: Optional[float],
+    market_score: float = 0.0,
+    vix_last: Optional[float] = None,
 ) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
     """Long-oriented entry zone, stop under support/ATR, targets toward resistance/ATR multiples."""
-    a = atr if atr and atr > 0 else price * 0.02
-    low = price - 0.35 * a
+    base_a = atr if atr and atr > 0 else price * 0.02
+    bm, lx = _entry_market_adjustment(market_score, vix_last, atr, price)
+    a = base_a * bm
+    low = price - 0.35 * a - lx * base_a
     high = price + 0.25 * a
     if support and support < price:
         low = max(low, support - 0.1 * a)
@@ -95,9 +136,13 @@ def _levels_sell(
     atr: Optional[float],
     support: Optional[float],
     resistance: Optional[float],
+    market_score: float = 0.0,
+    vix_last: Optional[float] = None,
 ) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
     """Short-oriented: entry near resistance, stop above, targets lower."""
-    a = atr if atr and atr > 0 else price * 0.02
+    base_a = atr if atr and atr > 0 else price * 0.02
+    bm, _lx = _entry_market_adjustment(market_score, vix_last, atr, price)
+    a = base_a * bm
     low = price - 0.25 * a
     high = price + 0.35 * a
     if resistance and resistance > price:
@@ -127,9 +172,13 @@ def _levels_sell(
 def _levels_hold(
     price: float,
     atr: Optional[float],
+    market_score: float = 0.0,
+    vix_last: Optional[float] = None,
 ) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
-    a = atr if atr and atr > 0 else price * 0.02
-    low = price - 0.3 * a
+    base_a = atr if atr and atr > 0 else price * 0.02
+    bm, lx = _entry_market_adjustment(market_score, vix_last, atr, price)
+    a = base_a * bm
+    low = price - 0.3 * a - lx * base_a
     high = price + 0.3 * a
     return (
         EntryRange(low=round(low, 4), high=round(high, 4)),
@@ -161,13 +210,16 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     price = tech.last_close
     atr = tech.atr_14
     sup, res = tech.support, tech.resistance
+    vix = market.get("vix_last")
+    vix_f = float(vix) if vix is not None else None
+    bm, lx = _entry_market_adjustment(ms, vix_f, atr, price)
 
     if direction == TradeDirection.BUY:
-        entry, stop, tps, rr = _levels_buy(price, atr, sup, res)
+        entry, stop, tps, rr = _levels_buy(price, atr, sup, res, ms, vix_f)
     elif direction == TradeDirection.SELL:
-        entry, stop, tps, rr = _levels_sell(price, atr, sup, res)
+        entry, stop, tps, rr = _levels_sell(price, atr, sup, res, ms, vix_f)
     else:
-        entry, stop, tps, rr = _levels_hold(price, atr)
+        entry, stop, tps, rr = _levels_hold(price, atr, ms, vix_f)
 
     summary_points: list[str] = []
     if tech.rsi_14 is not None:
@@ -191,6 +243,9 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     if market.get("spy_return_5d") is not None:
         summary_points.append(f"SPY 5d return (context): {float(market['spy_return_5d']):+.2f}%")
     summary_points.append(f"Market context score: {ms:+.2f}; session (pre/post) score: {es:+.2f}")
+    summary_points.append(
+        f"Entry band vs market: ATR scale ×{bm:.2f}, extra dip room +{lx:.2f}×ATR (weak tape / VIX / vol)"
+    )
     summary_points.append(sess.get("summary") or "Extended hours: n/a")
 
     rationale = (
@@ -230,6 +285,11 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
             "market": ms,
             "session": es,
             "combined": comb,
+        },
+        "entry_vs_market": {
+            "atr_band_multiplier": round(float(bm), 4),
+            "extra_low_atr_units": round(float(lx), 4),
+            "note": "Wider bands + lower entry when market_score<0, VIX elevated, or stock ATR% high.",
         },
         "market": market,
         "extended_session": sess,
