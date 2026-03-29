@@ -6,21 +6,36 @@ from typing import Any, Optional
 
 from backend.data_fetch import FetchedStockData, fetch_stock_data
 from backend.fundamental import extract_fundamentals, fundamental_score
+from backend.market_session import get_market_snapshot
 from backend.schemas import EntryRange, RiskReward, StockAnalysis, TradeDirection
 from backend.sentiment import analyze_news_sentiment, sentiment_score
 from backend.technical import TechnicalSnapshot, compute_technicals, technical_score
 
-
-WT_TECH = 0.5
-WT_FUND = 0.25
-WT_SENT = 0.25
+# Weights include broad market (SPY/VIX) and extended-hours session tilt
+WT_TECH = 0.40
+WT_FUND = 0.18
+WT_SENT = 0.18
+WT_MARKET = 0.14
+WT_SESSION = 0.10
 
 BUY_THRESHOLD = 0.18
 SELL_THRESHOLD = -0.18
 
 
-def _combined_score(tech_s: float, fund_s: float, sent_s: float) -> float:
-    return WT_TECH * tech_s + WT_FUND * fund_s + WT_SENT * sent_s
+def _combined_score(
+    tech_s: float,
+    fund_s: float,
+    sent_s: float,
+    market_s: float,
+    session_s: float,
+) -> float:
+    return (
+        WT_TECH * tech_s
+        + WT_FUND * fund_s
+        + WT_SENT * sent_s
+        + WT_MARKET * market_s
+        + WT_SESSION * session_s
+    )
 
 
 def _direction_from_score(s: float) -> TradeDirection:
@@ -129,11 +144,15 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     tech: TechnicalSnapshot = compute_technicals(data.history)
     fund = extract_fundamentals(data.info)
     sent = analyze_news_sentiment(data.news, ticker=data.ticker)
+    market = get_market_snapshot()
+    sess = data.extended_session
+    ms = float(market.get("market_score") or 0.0)
+    es = float(sess.get("session_score") or 0.0)
 
     ts = technical_score(tech)
     fs = fundamental_score(fund)
     ss = sentiment_score(sent)
-    comb = _combined_score(ts, fs, ss)
+    comb = _combined_score(ts, fs, ss, ms, es)
     direction = _direction_from_score(comb)
 
     has_fund = fund.pe_ratio is not None or fund.eps_ttm is not None
@@ -167,8 +186,16 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     else:
         summary_points.append("No recent headlines for sentiment")
 
+    if market.get("vix_last") is not None:
+        summary_points.append(f"VIX last ~{float(market['vix_last']):.2f}")
+    if market.get("spy_return_5d") is not None:
+        summary_points.append(f"SPY 5d return (context): {float(market['spy_return_5d']):+.2f}%")
+    summary_points.append(f"Market context score: {ms:+.2f}; session (pre/post) score: {es:+.2f}")
+    summary_points.append(sess.get("summary") or "Extended hours: n/a")
+
     rationale = (
-        f"Blended score {comb:.2f} (tech {ts:.2f}, fund {fs:.2f}, sent {ss:.2f}). "
+        f"Blended score {comb:.2f} (tech {ts:.2f}, fund {fs:.2f}, sent {ss:.2f}, "
+        f"market {ms:.2f}, session {es:.2f}). "
         f"Direction {direction.value} with confidence {conf:.0%}."
     )
 
@@ -177,6 +204,8 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         triggers.append(f"Monitor daily close vs 200 SMA (~{tech.sma_200:.2f})")
     if tech.macd is not None and tech.macd_signal is not None:
         triggers.append("Watch MACD cross vs signal line")
+    if market.get("vix_last") is not None and float(market["vix_last"]) >= 25:
+        triggers.append("Elevated VIX: size down or wait for market stabilization")
     triggers.append(f"Invalidation: stop near {stop}")
 
     steps: list[str] = [
@@ -194,7 +223,16 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
             "headline_count": sent.headline_count,
             "sample_headlines": sent.sample_headlines,
         },
-        "scores": {"technical": ts, "fundamental": fs, "sentiment": ss, "combined": comb},
+        "scores": {
+            "technical": ts,
+            "fundamental": fs,
+            "sentiment": ss,
+            "market": ms,
+            "session": es,
+            "combined": comb,
+        },
+        "market": {k: v for k, v in market.items() if k != "error"},
+        "extended_session": sess,
     }
 
     return StockAnalysis(

@@ -131,15 +131,21 @@ def main() -> None:
                     for p in pts:
                         st.markdown(f"- {p}")
 
-            with st.expander(f"Technical / fundamental / sentiment — {item.get('ticker')}"):
+            with st.expander(f"Details — {item.get('ticker')}"):
                 det = item.get("details") or {}
-                ttab, ftab, stab = st.tabs(["Technical", "Fundamental", "Sentiment"])
+                ttab, ftab, stab, mtab, xtab = st.tabs(
+                    ["Technical", "Fundamental", "Sentiment", "Market (SPY/VIX)", "Pre / after hours"]
+                )
                 with ttab:
                     st.json(det.get("technical") or {})
                 with ftab:
                     st.json(det.get("fundamental") or {})
                 with stab:
                     st.json(det.get("sentiment") or {})
+                with mtab:
+                    st.json(det.get("market") or {})
+                with xtab:
+                    st.json(det.get("extended_session") or {})
                 st.write("**Monitoring triggers**")
                 for tr in item.get("monitoring_triggers") or []:
                     st.markdown(f"- {tr}")

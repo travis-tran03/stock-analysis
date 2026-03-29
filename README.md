@@ -2,7 +2,7 @@
 
 **Streamlit** UI imports **`backend/`** directly (one process, no HTTP). Optional **FastAPI** (`backend/main.py`) exposes the same analysis for REST clients or tests.
 
-Data: **yfinance** (OHLCV, fundamentals, news); indicators are **pandas/numpy** only (no `numba`/`pandas-ta`, so Python 3.14+ and Streamlit Cloud installs stay reliable). **TextBlob** + optional **RSS** (sentiment).
+Data: **yfinance** (OHLCV, fundamentals, news); indicators are **pandas/numpy** only (no `numba`/`pandas-ta`, so Python 3.14+ and Streamlit Cloud installs stay reliable). **TextBlob** + optional **RSS** (sentiment). **Broad market:** **SPY** (trend vs MAs, 5d return) and **VIX** level feed a **market score** (cached ~90s across tickers). **Pre/after hours:** quote fields (`preMarket*`, `postMarket*`, `marketState`) feed a **session score** when Yahoo supplies them (often empty outside relevant windows).
 
 ## Setup
 

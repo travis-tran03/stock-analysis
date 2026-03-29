@@ -9,6 +9,8 @@ from typing import Any, Optional
 import pandas as pd
 import yfinance as yf
 
+from backend.market_session import extended_session_from_info
+
 
 def normalize_ticker(raw: str) -> str:
     """Uppercase, strip, and remove common separators."""
@@ -43,6 +45,7 @@ class FetchedStockData:
     history: pd.DataFrame
     info: dict[str, Any]
     news: list[dict[str, Any]]
+    extended_session: dict[str, Any]
 
 
 def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockData:
@@ -79,4 +82,12 @@ def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockDat
     except Exception:
         news = []
 
-    return FetchedStockData(ticker=ticker, history=hist, info=info, news=news)
+    ext_sess = extended_session_from_info(info)
+
+    return FetchedStockData(
+        ticker=ticker,
+        history=hist,
+        info=info,
+        news=news,
+        extended_session=ext_sess,
+    )
