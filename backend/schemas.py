@@ -56,8 +56,7 @@ class StockAnalysis(BaseModel):
     ticker: str
     direction: TradeDirection
     confidence: float = Field(ge=0.0, le=1.0)
-    planned_entry_range: Optional[EntryRange] = None
-    final_entry_range: Optional[EntryRange] = None
+    entry_range: Optional[EntryRange] = None
     entry_price: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profits: list[float] = Field(default_factory=list)

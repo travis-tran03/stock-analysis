@@ -236,10 +236,15 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     final_entry = planned_entry
     premarket_analysis = None
 
-    # Pre-market adjustment: only meaningful for BUY/SELL setups
+    # Extended-hours adjustment:
+    # - Always compute pre/after-hours diagnostics (for display + scoring context).
+    # - Apply price-level adjustments:
+    #   - For BUY/SELL: adjust using same direction.
+    #   - For HOLD: only adjust if extended-hours move is significant; use move sign to pick a
+    #     "conditional breakout" direction (gap up -> BUY breakout, gap down -> SELL breakdown).
     afterhours_analysis = None
 
-    if direction in (TradeDirection.BUY, TradeDirection.SELL) and data.extended_hours is not None:
+    if data.extended_hours is not None:
         avg_vol = None
         try:
             avg_vol = float(data.info.get("averageVolume") or data.info.get("averageVolume10days") or 0) or None
@@ -250,8 +255,13 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
 
         mode, use_pre, use_post = pick_helpful_extended_hours(data.info, premarket_analysis, afterhours_analysis)
         if mode == "PRE" and use_pre is not None:
+            implied_dir = direction
+            if direction == TradeDirection.HOLD:
+                chg = premarket_analysis.premarket_change_percent
+                if chg is not None and abs(chg) > 3.0:
+                    implied_dir = TradeDirection.BUY if chg > 0 else TradeDirection.SELL
             adj_range, adj_entry, adj_stop, adj_tps, adj_rr, premarket_analysis, wait_open = adjust_trade_levels(
-                direction=direction,
+                direction=implied_dir,
                 planned_range=planned_range,
                 planned_entry_price=planned_entry,
                 atr=atr,
@@ -266,8 +276,13 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
             elif premarket_analysis.premarket_signal == "STRONG":
                 conf = float(max(0.1, min(0.95, conf * 1.03)))
         elif mode == "POST" and use_post is not None:
+            implied_dir = direction
+            if direction == TradeDirection.HOLD:
+                chg = afterhours_analysis.afterhours_change_percent if afterhours_analysis else None
+                if chg is not None and abs(chg) > 3.0:
+                    implied_dir = TradeDirection.BUY if chg > 0 else TradeDirection.SELL
             adj_range, adj_entry, adj_stop, adj_tps, adj_rr, afterhours_analysis, wait_post = adjust_trade_levels_afterhours(
-                direction=direction,
+                direction=implied_dir,
                 planned_range=planned_range,
                 planned_entry_price=planned_entry,
                 atr=atr,
@@ -376,12 +391,17 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         "afterhours": afterhours_analysis.model_dump(mode="json") if afterhours_analysis else {},
     }
 
+    # Keep planned vs adjusted zones in details for transparency/debugging.
+    details["entry_ranges"] = {
+        "planned": {"low": planned_range.low, "high": planned_range.high},
+        "final": {"low": final_range.low, "high": final_range.high},
+    }
+
     return StockAnalysis(
         ticker=data.ticker,
         direction=direction,
         confidence=conf,
-        planned_entry_range=planned_range,
-        final_entry_range=final_range,
+        entry_range=final_range,
         entry_price=final_entry,
         stop_loss=stop,
         take_profits=tps,

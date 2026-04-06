@@ -96,8 +96,7 @@ def main() -> None:
             tps = item.get("take_profits") or []
             rr = item.get("risk_reward") or {}
             rat = item.get("rationale") or ""
-            planned = item.get("planned_entry_range") or {}
-            final = item.get("final_entry_range") or {}
+            er = item.get("entry_range") or {}
             pm = item.get("premarket_analysis") or {}
             ah = item.get("afterhours_analysis") or {}
             rows.append(
@@ -105,8 +104,7 @@ def main() -> None:
                     "Ticker": item.get("ticker"),
                     "Direction": item.get("direction"),
                     "Confidence": f"{float(item.get('confidence') or 0):.0%}",
-                    "Planned entry": f"{planned.get('low')} – {planned.get('high')}",
-                    "Final entry": f"{final.get('low')} – {final.get('high')}",
+                    "Entry range": f"{er.get('low')} – {er.get('high')}",
                     "Entry price": item.get("entry_price"),
                     "Pre %": pm.get("premarket_change_percent"),
                     "Pre signal": pm.get("premarket_signal"),
@@ -132,10 +130,8 @@ def main() -> None:
                     f"**{item.get('ticker')}**  \n"
                     f"Confidence: **{float(item.get('confidence') or 0):.0%}**"
                 )
-                planned = item.get("planned_entry_range") or {}
-                final = item.get("final_entry_range") or {}
-                st.write("**Planned entry:**", f"{planned.get('low')} – {planned.get('high')}")
-                st.write("**Final entry:**", f"{final.get('low')} – {final.get('high')}")
+                er = item.get("entry_range") or {}
+                st.write("**Entry range:**", f"{er.get('low')} – {er.get('high')}")
                 st.write("**Entry price (single):**", item.get("entry_price"))
                 st.write("**Stop:**", item.get("stop_loss"))
                 st.write("**Take profits:**", item.get("take_profits"))

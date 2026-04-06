@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import pandas as pd
+import yfinance as yf
 from backend.market_session import extended_session_from_info
 from backend.premarket import ExtendedHoursFetchResult, fetch_extended_hours_data
 
