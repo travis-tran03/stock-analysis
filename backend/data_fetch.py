@@ -7,9 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import pandas as pd
-import yfinance as yf
-
 from backend.market_session import extended_session_from_info
+from backend.premarket import ExtendedHoursFetchResult, fetch_extended_hours_data
 
 
 def normalize_ticker(raw: str) -> str:
@@ -46,6 +45,7 @@ class FetchedStockData:
     info: dict[str, Any]
     news: list[dict[str, Any]]
     extended_session: dict[str, Any]
+    extended_hours: Optional[ExtendedHoursFetchResult] = None
 
 
 def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockData:
@@ -84,10 +84,17 @@ def fetch_stock_data(ticker: str, history_period: str = "2y") -> FetchedStockDat
 
     ext_sess = extended_session_from_info(info)
 
+    ext_hours: Optional[ExtendedHoursFetchResult] = None
+    try:
+        ext_hours = fetch_extended_hours_data(ticker, info)
+    except Exception:
+        ext_hours = None
+
     return FetchedStockData(
         ticker=ticker,
         history=hist,
         info=info,
         news=news,
         extended_session=ext_sess,
+        extended_hours=ext_hours,
     )

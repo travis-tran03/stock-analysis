@@ -7,6 +7,13 @@ from typing import Any, Optional
 from backend.data_fetch import FetchedStockData, fetch_stock_data
 from backend.fundamental import extract_fundamentals, fundamental_score
 from backend.market_session import get_market_snapshot
+from backend.premarket import (
+    adjust_trade_levels,
+    adjust_trade_levels_afterhours,
+    analyze_afterhours_conditions,
+    analyze_premarket_conditions,
+    pick_helpful_extended_hours,
+)
 from backend.schemas import EntryRange, RiskReward, StockAnalysis, TradeDirection
 from backend.sentiment import analyze_news_sentiment, sentiment_score
 from backend.technical import TechnicalSnapshot, compute_technicals, technical_score
@@ -99,7 +106,7 @@ def _levels_buy(
     resistance: Optional[float],
     market_score: float = 0.0,
     vix_last: Optional[float] = None,
-) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
+) -> tuple[EntryRange, Optional[float], Optional[float], list[float], RiskReward]:
     """Long-oriented entry zone, stop under support/ATR, targets toward resistance/ATR multiples."""
     base_a = atr if atr and atr > 0 else price * 0.02
     bm, lx = _entry_market_adjustment(market_score, vix_last, atr, price)
@@ -108,7 +115,7 @@ def _levels_buy(
     high = price + 0.25 * a
     if support and support < price:
         low = max(low, support - 0.1 * a)
-    entry_mid = (low + high) / 2.0
+    entry_price = (low + high) / 2.0
     stop = (support - 0.5 * a) if support else (price - 1.5 * a)
     stop = min(stop, price - 0.5 * a)
 
@@ -118,13 +125,14 @@ def _levels_buy(
         tp1 = min(tp1, resistance - 0.05 * a)
         tp2 = max(tp2, min(resistance + 0.5 * a, price + 3.5 * a))
 
-    risk = entry_mid - stop
-    reward = max(tp1 - entry_mid, a)
+    risk = entry_price - stop
+    reward = max(tp1 - entry_price, a)
     rr = (reward / risk) if risk and risk > 0 else None
     label = f"~{rr:.2f}:1" if rr else "n/a"
 
     return (
         EntryRange(low=round(low, 4), high=round(high, 4)),
+        round(entry_price, 4),
         round(stop, 4),
         [round(tp1, 4), round(tp2, 4)],
         RiskReward(ratio=round(rr, 3) if rr else None, label=label),
@@ -138,7 +146,7 @@ def _levels_sell(
     resistance: Optional[float],
     market_score: float = 0.0,
     vix_last: Optional[float] = None,
-) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
+) -> tuple[EntryRange, Optional[float], Optional[float], list[float], RiskReward]:
     """Short-oriented: entry near resistance, stop above, targets lower."""
     base_a = atr if atr and atr > 0 else price * 0.02
     bm, _lx = _entry_market_adjustment(market_score, vix_last, atr, price)
@@ -147,7 +155,7 @@ def _levels_sell(
     high = price + 0.35 * a
     if resistance and resistance > price:
         high = min(high, resistance + 0.1 * a)
-    entry_mid = (low + high) / 2.0
+    entry_price = (low + high) / 2.0
     stop = (resistance + 0.5 * a) if resistance else (price + 1.5 * a)
     stop = max(stop, price + 0.5 * a)
 
@@ -156,13 +164,14 @@ def _levels_sell(
     if support and support < price:
         tp1 = max(tp1, support + 0.05 * a)
 
-    risk = stop - entry_mid
-    reward = max(entry_mid - tp1, a)
+    risk = stop - entry_price
+    reward = max(entry_price - tp1, a)
     rr = (reward / risk) if risk and risk > 0 else None
     label = f"~{rr:.2f}:1" if rr else "n/a"
 
     return (
         EntryRange(low=round(low, 4), high=round(high, 4)),
+        round(entry_price, 4),
         round(stop, 4),
         [round(tp1, 4), round(tp2, 4)],
         RiskReward(ratio=round(rr, 3) if rr else None, label=label),
@@ -174,14 +183,16 @@ def _levels_hold(
     atr: Optional[float],
     market_score: float = 0.0,
     vix_last: Optional[float] = None,
-) -> tuple[EntryRange, Optional[float], list[float], RiskReward]:
+) -> tuple[EntryRange, Optional[float], Optional[float], list[float], RiskReward]:
     base_a = atr if atr and atr > 0 else price * 0.02
     bm, lx = _entry_market_adjustment(market_score, vix_last, atr, price)
     a = base_a * bm
     low = price - 0.3 * a - lx * base_a
     high = price + 0.3 * a
+    entry_price = (low + high) / 2.0
     return (
         EntryRange(low=round(low, 4), high=round(high, 4)),
+        round(entry_price, 4),
         round(price - 1.2 * a, 4),
         [round(price + 1.2 * a, 4), round(price - 1.2 * a, 4)],
         RiskReward(ratio=None, label="wait for clarity"),
@@ -215,11 +226,61 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     bm, lx = _entry_market_adjustment(ms, vix_f, atr, price)
 
     if direction == TradeDirection.BUY:
-        entry, stop, tps, rr = _levels_buy(price, atr, sup, res, ms, vix_f)
+        planned_range, planned_entry, stop, tps, rr = _levels_buy(price, atr, sup, res, ms, vix_f)
     elif direction == TradeDirection.SELL:
-        entry, stop, tps, rr = _levels_sell(price, atr, sup, res, ms, vix_f)
+        planned_range, planned_entry, stop, tps, rr = _levels_sell(price, atr, sup, res, ms, vix_f)
     else:
-        entry, stop, tps, rr = _levels_hold(price, atr, ms, vix_f)
+        planned_range, planned_entry, stop, tps, rr = _levels_hold(price, atr, ms, vix_f)
+
+    final_range = planned_range
+    final_entry = planned_entry
+    premarket_analysis = None
+
+    # Pre-market adjustment: only meaningful for BUY/SELL setups
+    afterhours_analysis = None
+
+    if direction in (TradeDirection.BUY, TradeDirection.SELL) and data.extended_hours is not None:
+        avg_vol = None
+        try:
+            avg_vol = float(data.info.get("averageVolume") or data.info.get("averageVolume10days") or 0) or None
+        except Exception:
+            avg_vol = None
+        premarket_analysis = analyze_premarket_conditions(data.extended_hours.premarket, avg_daily_volume=avg_vol)
+        afterhours_analysis = analyze_afterhours_conditions(data.extended_hours.afterhours, avg_daily_volume=avg_vol)
+
+        mode, use_pre, use_post = pick_helpful_extended_hours(data.info, premarket_analysis, afterhours_analysis)
+        if mode == "PRE" and use_pre is not None:
+            adj_range, adj_entry, adj_stop, adj_tps, adj_rr, premarket_analysis, wait_open = adjust_trade_levels(
+                direction=direction,
+                planned_range=planned_range,
+                planned_entry_price=planned_entry,
+                atr=atr,
+                resistance=res,
+                support=sup,
+                premkt=premarket_analysis,
+            )
+            if not wait_open and adj_entry is not None and adj_stop is not None and adj_tps:
+                final_range, final_entry, stop, tps, rr = adj_range, adj_entry, adj_stop, adj_tps, adj_rr
+            if premarket_analysis.premarket_signal == "WEAK":
+                conf = float(max(0.1, min(0.95, conf * 0.92)))
+            elif premarket_analysis.premarket_signal == "STRONG":
+                conf = float(max(0.1, min(0.95, conf * 1.03)))
+        elif mode == "POST" and use_post is not None:
+            adj_range, adj_entry, adj_stop, adj_tps, adj_rr, afterhours_analysis, wait_post = adjust_trade_levels_afterhours(
+                direction=direction,
+                planned_range=planned_range,
+                planned_entry_price=planned_entry,
+                atr=atr,
+                resistance=res,
+                support=sup,
+                aft=afterhours_analysis,
+            )
+            if not wait_post and adj_entry is not None and adj_stop is not None and adj_tps:
+                final_range, final_entry, stop, tps, rr = adj_range, adj_entry, adj_stop, adj_tps, adj_rr
+            if afterhours_analysis.afterhours_signal == "WEAK":
+                conf = float(max(0.1, min(0.95, conf * 0.92)))
+            elif afterhours_analysis.afterhours_signal == "STRONG":
+                conf = float(max(0.1, min(0.95, conf * 1.03)))
 
     summary_points: list[str] = []
     if tech.rsi_14 is not None:
@@ -244,9 +305,13 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         summary_points.append(f"SPY 5d return (context): {float(market['spy_return_5d']):+.2f}%")
     summary_points.append(f"Market context score: {ms:+.2f}; session (pre/post) score: {es:+.2f}")
     summary_points.append(
-        f"Entry band vs market: ATR scale ×{bm:.2f}, extra dip room +{lx:.2f}×ATR (weak tape / VIX / vol)"
+        f"Entry vs market: ATR scale ×{bm:.2f}, extra dip room +{lx:.2f}×ATR (weak tape / VIX / vol)"
     )
     summary_points.append(sess.get("summary") or "Extended hours: n/a")
+    if premarket_analysis and premarket_analysis.premarket_change_percent is not None:
+        summary_points.append(f"Pre-market change vs prev close: {premarket_analysis.premarket_change_percent:+.2f}% ({premarket_analysis.premarket_signal})")
+    if afterhours_analysis and afterhours_analysis.afterhours_change_percent is not None:
+        summary_points.append(f"After-hours change vs regular close: {afterhours_analysis.afterhours_change_percent:+.2f}% ({afterhours_analysis.afterhours_signal})")
 
     rationale = (
         f"Blended score {comb:.2f} (tech {ts:.2f}, fund {fs:.2f}, sent {ss:.2f}, "
@@ -264,11 +329,25 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     triggers.append(f"Invalidation: stop near {stop}")
 
     steps: list[str] = [
-        f"1. Plan entry between {entry.low} and {entry.high} (last ~{price:.2f}).",
+        f"1. Planned entry zone: {planned_range.low} – {planned_range.high} (mid ~{planned_entry}; last ~{price:.2f}).",
         f"2. Set stop at {stop}; size position so risk fits your rules.",
         f"3. Take profit scale-out at {tps}.",
         "4. Re-evaluate if macro or earnings change the thesis.",
     ]
+    if premarket_analysis:
+        steps.insert(
+            1,
+            "1b. Pre-market check: "
+            + (premarket_analysis.note or "n/a")
+            + (" (entry adjusted)." if final_range != planned_range else " (no entry adjustment)."),
+        )
+    if afterhours_analysis:
+        steps.insert(
+            1,
+            "1c. After-hours check: "
+            + (afterhours_analysis.note or "n/a")
+            + (" (entry adjusted)." if final_range != planned_range else " (no entry adjustment)."),
+        )
 
     details: dict[str, Any] = {
         "technical": tech.raw_row,
@@ -293,16 +372,22 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         },
         "market": market,
         "extended_session": sess,
+        "premarket": premarket_analysis.model_dump(mode="json") if premarket_analysis else {},
+        "afterhours": afterhours_analysis.model_dump(mode="json") if afterhours_analysis else {},
     }
 
     return StockAnalysis(
         ticker=data.ticker,
         direction=direction,
         confidence=conf,
-        entry_range=entry,
+        planned_entry_range=planned_range,
+        final_entry_range=final_range,
+        entry_price=final_entry,
         stop_loss=stop,
         take_profits=tps,
         risk_reward=rr,
+        premarket_analysis=premarket_analysis,
+        afterhours_analysis=afterhours_analysis,
         rationale=rationale,
         summary_points=summary_points,
         monitoring_triggers=triggers,
