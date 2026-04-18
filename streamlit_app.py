@@ -2,11 +2,92 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
+import pandas as pd
 import streamlit as st
 
 from backend.analysis_runner import run_analyze
+
+
+def _num(v: Any) -> float:
+    if v is None:
+        return float("nan")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _optional_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame:
+    """Wide comparison table; default sort by blended score desc applied by caller."""
+    rows: list[dict[str, Any]] = []
+    for item in results_dicts:
+        det = item.get("details") or {}
+        tech = det.get("technical") or {}
+        scores = det.get("scores") or {}
+        er = item.get("entry_range") or {}
+        pm = item.get("premarket_analysis") or {}
+        ah = item.get("afterhours_analysis") or {}
+        rr = item.get("risk_reward") or {}
+
+        last = _optional_float(tech.get("last_close"))
+        low = _optional_float(er.get("low"))
+        high = _optional_float(er.get("high"))
+
+        delta_to_low: Optional[float] = None
+        if last is not None and low is not None and last > 0:
+            delta_to_low = (last - low) / last * 100.0
+
+        comb = _optional_float(scores.get("combined"))
+        conf = _optional_float(item.get("confidence"))
+
+        direction = str(item.get("direction") or "HOLD")
+        buy_lean: Optional[float] = None
+        if direction == "BUY" and comb is not None and conf is not None:
+            buy_lean = comb * conf
+
+        # ProgressColumn uses printf formatting; values 0–1 with "%.0f%%" print as 0%.
+        conf_pct = conf * 100.0 if conf is not None else float("nan")
+
+        rows.append(
+            {
+                "Ticker": item.get("ticker"),
+                "Direction": direction,
+                "Confidence": conf_pct,
+                "Last": last if last is not None else float("nan"),
+                "Buy low": low if low is not None else float("nan"),
+                "Buy high": high if high is not None else float("nan"),
+                "Day Δ %": _num(tech.get("change_1d_pct")),
+                "Δ to buy low %": delta_to_low if delta_to_low is not None else float("nan"),
+                "Blended": comb if comb is not None else float("nan"),
+                "Tech": _num(scores.get("technical")),
+                "Fund": _num(scores.get("fundamental")),
+                "Sent": _num(scores.get("sentiment")),
+                "Market": _num(scores.get("market")),
+                "Sess": _num(scores.get("session")),
+                "R:R": _num(rr.get("ratio")),
+                "R:R label": rr.get("label") or "",
+                "RSI": _num(tech.get("rsi_14")),
+                "Pre %": _num(pm.get("premarket_change_percent")),
+                "AH %": _num(ah.get("afterhours_change_percent")),
+                "Buy lean": buy_lean if buy_lean is not None else float("nan"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if not df.empty and "Blended" in df.columns:
+        df = df.sort_values("Blended", ascending=False, na_position="last")
+    return df
 
 
 def parse_tickers(text: str) -> list[str]:
@@ -91,34 +172,44 @@ def main() -> None:
         # Pydantic models → plain dicts for display
         results_dicts: list[dict[str, Any]] = [r.model_dump(mode="json") for r in results]
 
-        rows: list[dict[str, Any]] = []
-        for item in results_dicts:
-            tps = item.get("take_profits") or []
-            rr = item.get("risk_reward") or {}
-            rat = item.get("rationale") or ""
-            er = item.get("entry_range") or {}
-            pm = item.get("premarket_analysis") or {}
-            ah = item.get("afterhours_analysis") or {}
-            rows.append(
-                {
-                    "Ticker": item.get("ticker"),
-                    "Direction": item.get("direction"),
-                    "Confidence": f"{float(item.get('confidence') or 0):.0%}",
-                    "Entry range": f"{er.get('low')} – {er.get('high')}",
-                    "Entry price": item.get("entry_price"),
-                    "Pre %": pm.get("premarket_change_percent"),
-                    "Pre signal": pm.get("premarket_signal"),
-                    "AH %": ah.get("afterhours_change_percent"),
-                    "AH signal": ah.get("afterhours_signal"),
-                    "Stop": item.get("stop_loss"),
-                    "TPs": ", ".join(str(x) for x in tps),
-                    "R:R": rr.get("label") or "",
-                    "Rationale (short)": rat[:120] + "…" if len(rat) > 120 else rat,
-                }
-            )
-
-        st.subheader("Summary")
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        compare_df = build_compare_dataframe(results_dicts)
+        st.subheader("Compare tickers")
+        st.caption(
+            "Sorted by blended score (highest first). "
+            "“Δ to buy low %” is how far last price sits above the suggested entry low."
+        )
+        st.dataframe(
+            compare_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker"),
+                "Direction": st.column_config.TextColumn("Direction"),
+                "Confidence": st.column_config.ProgressColumn(
+                    "Confidence",
+                    format="%.0f%%",
+                    min_value=0.0,
+                    max_value=100.0,
+                ),
+                "Last": st.column_config.NumberColumn("Last", format="%.2f"),
+                "Buy low": st.column_config.NumberColumn("Buy low", format="%.2f"),
+                "Buy high": st.column_config.NumberColumn("Buy high", format="%.2f"),
+                "Day Δ %": st.column_config.NumberColumn("Day Δ %", format="%.2f"),
+                "Δ to buy low %": st.column_config.NumberColumn("Δ to buy low %", format="%.2f"),
+                "Blended": st.column_config.NumberColumn("Blended", format="%.3f"),
+                "Tech": st.column_config.NumberColumn("Tech", format="%.2f"),
+                "Fund": st.column_config.NumberColumn("Fund", format="%.2f"),
+                "Sent": st.column_config.NumberColumn("Sent", format="%.2f"),
+                "Market": st.column_config.NumberColumn("Market", format="%.2f"),
+                "Sess": st.column_config.NumberColumn("Sess", format="%.2f"),
+                "R:R": st.column_config.NumberColumn("R:R", format="%.2f"),
+                "R:R label": st.column_config.TextColumn("R:R label"),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                "Pre %": st.column_config.NumberColumn("Pre %", format="%.2f"),
+                "AH %": st.column_config.NumberColumn("AH %", format="%.2f"),
+                "Buy lean": st.column_config.NumberColumn("Buy lean", format="%.3f"),
+            },
+        )
 
         st.subheader("Details")
         for item in results_dicts:

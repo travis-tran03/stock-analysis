@@ -120,6 +120,13 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
     atr_14 = _last_valid(atr_series)
     last_close = float(close.iloc[-1])
 
+    prior_close: Optional[float] = None
+    change_1d_pct: Optional[float] = None
+    if len(close) >= 2:
+        prior_close = float(close.iloc[-2])
+        if prior_close > 0:
+            change_1d_pct = round((last_close - prior_close) / prior_close * 100.0, 4)
+
     pivot = r1 = s1 = None
     if len(df) >= 2:
         prev = df.iloc[-2]
@@ -143,6 +150,8 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
         "support_20d": sup,
         "resistance_20d": res,
         "last_close": last_close,
+        "prior_close": prior_close,
+        "change_1d_pct": change_1d_pct,
     }
 
     return TechnicalSnapshot(
