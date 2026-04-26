@@ -39,6 +39,10 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
         pm = item.get("premarket_analysis") or {}
         ah = item.get("afterhours_analysis") or {}
         rr = item.get("risk_reward") or {}
+        take_profits = item.get("take_profits") or []
+        tp1: Optional[float] = None
+        if isinstance(take_profits, list) and take_profits:
+            tp1 = _optional_float(take_profits[0])
 
         last = _optional_float(tech.get("last_close"))
         low = _optional_float(er.get("low"))
@@ -69,6 +73,7 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
                 "Last": last if last is not None else float("nan"),
                 "Buy low": low if low is not None else float("nan"),
                 "Buy high": high if high is not None else float("nan"),
+                "Sell": tp1 if tp1 is not None else float("nan"),
                 "Day Δ %": _num(tech.get("change_1d_pct")),
                 "Δ to buy low %": delta_to_low if delta_to_low is not None else float("nan"),
                 "RSI": _num(tech.get("rsi_14")),
@@ -104,6 +109,10 @@ def _compare_column_guide() -> dict[str, dict[str, str]]:
         "Last": {"meaning": "Last regular-session close.", "good": "Contextual (compare vs entry range)."},
         "Buy low": {"meaning": "Suggested lower bound of entry zone.", "good": "For BUY: last near/under this is favorable."},
         "Buy high": {"meaning": "Suggested upper bound of entry zone.", "good": "For BUY: last below this is generally better than above."},
+        "Sell": {
+            "meaning": "Suggested first take-profit level (TP1). For BUY this is a sell target; for SELL this is a buy-to-cover target.",
+            "good": "Contextual—use with R:R. Farther in your favor increases R:R, but may be less likely to hit.",
+        },
         "Day Δ %": {
             "meaning": "1-day % change (close vs prior close).",
             "good": "For BUY: ≤ 0% good, 0% to +1.5% ok, > +1.5% stretched. For SELL: ≥ 0% good, 0% to −1.5% ok, < −1.5% stretched.",
@@ -146,6 +155,15 @@ def _compare_column_guide() -> dict[str, dict[str, str]]:
             "good": "For BUY: ≥ 0.16 strong, 0.12–0.16 ok, < 0.12 weak; blank/NaN for non-BUY rows.",
         },
     }
+
+
+def _help_text(guide: dict[str, dict[str, str]], col: str) -> str:
+    meta = guide.get(col) or {}
+    meaning = (meta.get("meaning") or "").strip()
+    good = (meta.get("good") or "").strip()
+    if meaning and good:
+        return f"{meaning}\n\nLooks good: {good}"
+    return meaning or good or ""
 
 
 def _style_compare_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -360,34 +378,35 @@ def main() -> None:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", help=guide["Ticker"]["meaning"]),
-                "Direction": st.column_config.TextColumn("Direction", help=guide["Direction"]["meaning"]),
+                "Ticker": st.column_config.TextColumn("Ticker", help=_help_text(guide, "Ticker")),
+                "Direction": st.column_config.TextColumn("Direction", help=_help_text(guide, "Direction")),
                 "Confidence": st.column_config.ProgressColumn(
                     "Confidence",
                     format="%.0f%%",
                     min_value=0.0,
                     max_value=100.0,
-                    help=guide["Confidence"]["meaning"],
+                    help=_help_text(guide, "Confidence"),
                 ),
-                "Last": st.column_config.NumberColumn("Last", format="%.2f", help=guide["Last"]["meaning"]),
-                "Buy low": st.column_config.NumberColumn("Buy low", format="%.2f", help=guide["Buy low"]["meaning"]),
-                "Buy high": st.column_config.NumberColumn("Buy high", format="%.2f", help=guide["Buy high"]["meaning"]),
-                "Day Δ %": st.column_config.NumberColumn("Day Δ %", format="%.2f", help=guide["Day Δ %"]["meaning"]),
+                "Last": st.column_config.NumberColumn("Last", format="%.2f", help=_help_text(guide, "Last")),
+                "Buy low": st.column_config.NumberColumn("Buy low", format="%.2f", help=_help_text(guide, "Buy low")),
+                "Buy high": st.column_config.NumberColumn("Buy high", format="%.2f", help=_help_text(guide, "Buy high")),
+                "Sell": st.column_config.NumberColumn("Sell", format="%.2f", help=_help_text(guide, "Sell")),
+                "Day Δ %": st.column_config.NumberColumn("Day Δ %", format="%.2f", help=_help_text(guide, "Day Δ %")),
                 "Δ to buy low %": st.column_config.NumberColumn(
-                    "Δ to buy low %", format="%.2f", help=guide["Δ to buy low %"]["meaning"]
+                    "Δ to buy low %", format="%.2f", help=_help_text(guide, "Δ to buy low %")
                 ),
-                "RSI": st.column_config.NumberColumn("RSI", format="%.1f", help=guide["RSI"]["meaning"]),
-                "Blended": st.column_config.NumberColumn("Blended", format="%.3f", help=guide["Blended"]["meaning"]),
-                "Tech": st.column_config.NumberColumn("Tech", format="%.2f", help=guide["Tech"]["meaning"]),
-                "Fund": st.column_config.NumberColumn("Fund", format="%.2f", help=guide["Fund"]["meaning"]),
-                "Sent": st.column_config.NumberColumn("Sent", format="%.2f", help=guide["Sent"]["meaning"]),
-                "Market": st.column_config.NumberColumn("Market", format="%.2f", help=guide["Market"]["meaning"]),
-                "Sess": st.column_config.NumberColumn("Sess", format="%.2f", help=guide["Sess"]["meaning"]),
-                "R:R": st.column_config.NumberColumn("R:R", format="%.2f", help=guide["R:R"]["meaning"]),
-                "R:R label": st.column_config.TextColumn("R:R label", help=guide["R:R label"]["meaning"]),
-                "Pre %": st.column_config.NumberColumn("Pre %", format="%.2f", help=guide["Pre %"]["meaning"]),
-                "AH %": st.column_config.NumberColumn("AH %", format="%.2f", help=guide["AH %"]["meaning"]),
-                "Buy lean": st.column_config.NumberColumn("Buy lean", format="%.3f", help=guide["Buy lean"]["meaning"]),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f", help=_help_text(guide, "RSI")),
+                "Blended": st.column_config.NumberColumn("Blended", format="%.3f", help=_help_text(guide, "Blended")),
+                "Tech": st.column_config.NumberColumn("Tech", format="%.2f", help=_help_text(guide, "Tech")),
+                "Fund": st.column_config.NumberColumn("Fund", format="%.2f", help=_help_text(guide, "Fund")),
+                "Sent": st.column_config.NumberColumn("Sent", format="%.2f", help=_help_text(guide, "Sent")),
+                "Market": st.column_config.NumberColumn("Market", format="%.2f", help=_help_text(guide, "Market")),
+                "Sess": st.column_config.NumberColumn("Sess", format="%.2f", help=_help_text(guide, "Sess")),
+                "R:R": st.column_config.NumberColumn("R:R", format="%.2f", help=_help_text(guide, "R:R")),
+                "R:R label": st.column_config.TextColumn("R:R label", help=_help_text(guide, "R:R label")),
+                "Pre %": st.column_config.NumberColumn("Pre %", format="%.2f", help=_help_text(guide, "Pre %")),
+                "AH %": st.column_config.NumberColumn("AH %", format="%.2f", help=_help_text(guide, "AH %")),
+                "Buy lean": st.column_config.NumberColumn("Buy lean", format="%.3f", help=_help_text(guide, "Buy lean")),
             },
         )
 
