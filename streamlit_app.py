@@ -46,7 +46,9 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
 
         delta_to_low: Optional[float] = None
         if last is not None and low is not None and last > 0:
-            delta_to_low = (last - low) / last * 100.0
+            # Percent move from last down to the suggested entry low.
+            # Typically negative (buy-low is below last).
+            delta_to_low = (low - last) / last * 100.0
 
         comb = _optional_float(scores.get("combined"))
         conf = _optional_float(item.get("confidence"))
@@ -69,6 +71,7 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
                 "Buy high": high if high is not None else float("nan"),
                 "Day Δ %": _num(tech.get("change_1d_pct")),
                 "Δ to buy low %": delta_to_low if delta_to_low is not None else float("nan"),
+                "RSI": _num(tech.get("rsi_14")),
                 "Blended": comb if comb is not None else float("nan"),
                 "Tech": _num(scores.get("technical")),
                 "Fund": _num(scores.get("fundamental")),
@@ -77,7 +80,6 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
                 "Sess": _num(scores.get("session")),
                 "R:R": _num(rr.get("ratio")),
                 "R:R label": rr.get("label") or "",
-                "RSI": _num(tech.get("rsi_14")),
                 "Pre %": _num(pm.get("premarket_change_percent")),
                 "AH %": _num(ah.get("afterhours_change_percent")),
                 "Buy lean": buy_lean if buy_lean is not None else float("nan"),
@@ -88,6 +90,169 @@ def build_compare_dataframe(results_dicts: list[dict[str, Any]]) -> pd.DataFrame
     if not df.empty and "Blended" in df.columns:
         df = df.sort_values("Blended", ascending=False, na_position="last")
     return df
+
+
+def _compare_column_guide() -> dict[str, dict[str, str]]:
+    """
+    Human-friendly guide shown in the UI. Scores are generally in [-1, 1].
+    Keep this lightweight: it's a heuristic guide, not financial advice.
+    """
+    return {
+        "Ticker": {"meaning": "Stock symbol."},
+        "Direction": {"meaning": "Model trade lean from blended score.", "good": "BUY / SELL when supported by other columns."},
+        "Confidence": {"meaning": "How confident the model is (0–100%).", "good": "70%+ strong, 50–70% moderate, <40% weak."},
+        "Last": {"meaning": "Last regular-session close.", "good": "Contextual (compare vs entry range)."},
+        "Buy low": {"meaning": "Suggested lower bound of entry zone.", "good": "For BUY: last near/under this is favorable."},
+        "Buy high": {"meaning": "Suggested upper bound of entry zone.", "good": "For BUY: last below this is generally better than above."},
+        "Day Δ %": {
+            "meaning": "1-day % change (close vs prior close).",
+            "good": "For BUY: ≤ 0% good, 0% to +1.5% ok, > +1.5% stretched. For SELL: ≥ 0% good, 0% to −1.5% ok, < −1.5% stretched.",
+        },
+        "Δ to buy low %": {
+            "meaning": "Percent move from last price down to the suggested entry low (typically negative).",
+            "good": "For BUY: ~0% to −1% great, −1% to −3% ok, <−5% far away.",
+        },
+        "RSI": {"meaning": "RSI(14).", "good": "For BUY: <45 favorable (esp <30). For SELL: >55 favorable (esp >70)."},
+        "Blended": {
+            "meaning": "Weighted score combining Tech/Fund/Sent/Market/Sess (range ~[-1, 1]).",
+            "good": "BUY if ≥ +0.18, SELL if ≤ −0.18 (stronger magnitude is better).",
+        },
+        "Tech": {
+            "meaning": "Technical sub-score (~[-1, 1]).",
+            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+        },
+        "Fund": {
+            "meaning": "Fundamental sub-score (~[-1, 1]).",
+            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+        },
+        "Sent": {
+            "meaning": "News sentiment sub-score (~[-1, 1]).",
+            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+        },
+        "Market": {
+            "meaning": "Broad market context score (SPY/VIX) (~[-1, 1]).",
+            "good": "For BUY: ≥ +0.22 supportive, +0.08 to +0.22 mildly supportive, < +0.08 neutral/against. For SELL: ≤ −0.22 supportive, −0.22 to −0.08 mildly supportive, > −0.08 neutral/against.",
+        },
+        "Sess": {
+            "meaning": "Extended-hours session score (~[-1, 1]).",
+            "good": "For BUY: ≥ +0.22 supportive, +0.08 to +0.22 mildly supportive, < +0.08 neutral/against. For SELL: ≤ −0.22 supportive, −0.22 to −0.08 mildly supportive, > −0.08 neutral/against.",
+        },
+        "R:R": {"meaning": "Estimated risk/reward ratio for the plan.", "good": "≥2.0 great, 1.3–2.0 ok, <1.3 weak."},
+        "R:R label": {"meaning": "Text label for risk/reward.", "good": "Higher is better (or 'wait for clarity' on HOLD)."},
+        "Pre %": {"meaning": "Pre-market % change vs prior regular close.", "good": "Aligned with direction is supportive; big moves (>|3%|) deserve caution."},
+        "AH %": {"meaning": "After-hours % change vs regular close.", "good": "Aligned with direction is supportive; big moves (>|3%|) deserve caution."},
+        "Buy lean": {
+            "meaning": "BUY-only: blended × confidence (higher = stronger BUY conviction).",
+            "good": "For BUY: ≥ 0.16 strong, 0.12–0.16 ok, < 0.12 weak; blank/NaN for non-BUY rows.",
+        },
+    }
+
+
+def _style_compare_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def css(bg: str) -> str:
+        return f"background-color: {bg};"
+
+    GREEN = "#d1fae5"   # emerald-100
+    YELLOW = "#fef3c7"  # amber-100
+    RED = "#fee2e2"     # red-100
+
+    def row_style(row: pd.Series) -> list[str]:
+        direction = str(row.get("Direction") or "HOLD").upper()
+        out = [""] * len(row)
+        idx = {c: i for i, c in enumerate(row.index)}
+
+        def set_cell(col: str, which: str) -> None:
+            if col not in idx:
+                return
+            out[idx[col]] = css({"g": GREEN, "y": YELLOW, "r": RED}.get(which, ""))
+
+        def f(col: str) -> float:
+            try:
+                return float(row.get(col))
+            except Exception:
+                return float("nan")
+
+        # Directional interpretation helpers (scores in [-1, 1])
+        sign = 1.0 if direction == "BUY" else (-1.0 if direction == "SELL" else 0.0)
+
+        # Confidence (0-100)
+        conf = f("Confidence")
+        if pd.notna(conf):
+            set_cell("Confidence", "g" if conf >= 70 else ("y" if conf >= 50 else "r"))
+
+        # Blended score
+        blended = f("Blended")
+        if pd.notna(blended):
+            if direction == "BUY":
+                set_cell("Blended", "g" if blended >= 0.18 else ("y" if blended >= 0.05 else "r"))
+            elif direction == "SELL":
+                set_cell("Blended", "g" if blended <= -0.18 else ("y" if blended <= -0.05 else "r"))
+            else:
+                set_cell("Blended", "y" if abs(blended) >= 0.12 else "")
+
+        # Δ to buy low % (closer to 0 is better for BUY; typically negative)
+        dlow = f("Δ to buy low %")
+        if pd.notna(dlow):
+            if direction == "BUY":
+                # Example: -0.5% (great), -2% (ok), -6% (far).
+                set_cell("Δ to buy low %", "g" if dlow >= -1.0 else ("y" if dlow >= -3.0 else "r"))
+            else:
+                set_cell("Δ to buy low %", "y" if dlow >= -1.0 else "")
+
+        # RSI (14)
+        rsi = f("RSI")
+        if pd.notna(rsi):
+            if direction == "BUY":
+                set_cell("RSI", "g" if rsi < 45 else ("y" if rsi < 55 else "r"))
+                if rsi < 30:
+                    set_cell("RSI", "g")
+            elif direction == "SELL":
+                set_cell("RSI", "g" if rsi > 55 else ("y" if rsi > 45 else "r"))
+                if rsi > 70:
+                    set_cell("RSI", "g")
+            else:
+                set_cell("RSI", "y" if (rsi < 35 or rsi > 65) else "")
+
+        # Subscores Tech/Fund/Sent/Market/Sess: prefer aligned sign with decent magnitude
+        for col in ("Tech", "Fund", "Sent", "Market", "Sess"):
+            v = f(col)
+            if pd.isna(v) or sign == 0.0:
+                continue
+            aligned = v * sign
+            set_cell(col, "g" if aligned >= 0.22 else ("y" if aligned >= 0.08 else "r"))
+
+        # Risk/Reward
+        rr = f("R:R")
+        if pd.notna(rr):
+            set_cell("R:R", "g" if rr >= 2.0 else ("y" if rr >= 1.3 else "r"))
+
+        # Day Δ %: mild directional tint
+        day = f("Day Δ %")
+        if pd.notna(day):
+            if direction == "BUY":
+                set_cell("Day Δ %", "g" if day <= 0.0 else ("y" if day <= 1.5 else "r"))
+            elif direction == "SELL":
+                set_cell("Day Δ %", "g" if day >= 0.0 else ("y" if day >= -1.5 else "r"))
+
+        # Extended session moves: big adverse moves red, aligned moves green
+        for col in ("Pre %", "AH %"):
+            v = f(col)
+            if pd.isna(v) or sign == 0.0:
+                continue
+            if abs(v) >= 3.0 and (v * sign) < 0:
+                set_cell(col, "r")
+            elif abs(v) >= 1.5 and (v * sign) > 0:
+                set_cell(col, "g")
+
+        # Buy lean (only meaningful for BUY)
+        bl = f("Buy lean")
+        if pd.notna(bl) and direction == "BUY":
+            # Example: blended 0.18 with 70% confidence => 0.126 (solid "ok").
+            set_cell("Buy lean", "g" if bl >= 0.16 else ("y" if bl >= 0.12 else "r"))
+
+        return out
+
+    return df.style.apply(row_style, axis=1)
 
 
 def parse_tickers(text: str) -> list[str]:
@@ -176,38 +341,53 @@ def main() -> None:
         st.subheader("Compare tickers")
         st.caption(
             "Sorted by blended score (highest first). "
-            "“Δ to buy low %” is how far last price sits above the suggested entry low."
+            "“Δ to buy low %” is the % move from last down to the suggested entry low."
         )
+        guide = _compare_column_guide()
+        with st.expander("Column guide (what it means + what looks good)"):
+            st.markdown(
+                "\n".join(
+                    [
+                        f"- **{col}**: {meta.get('meaning','')}"
+                        + (f"  \n  _Looks good_: {meta.get('good','')}" if meta.get("good") else "")
+                        for col, meta in guide.items()
+                        if col in compare_df.columns
+                    ]
+                )
+            )
         st.dataframe(
-            compare_df,
+            _style_compare_table(compare_df),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Direction": st.column_config.TextColumn("Direction"),
+                "Ticker": st.column_config.TextColumn("Ticker", help=guide["Ticker"]["meaning"]),
+                "Direction": st.column_config.TextColumn("Direction", help=guide["Direction"]["meaning"]),
                 "Confidence": st.column_config.ProgressColumn(
                     "Confidence",
                     format="%.0f%%",
                     min_value=0.0,
                     max_value=100.0,
+                    help=guide["Confidence"]["meaning"],
                 ),
-                "Last": st.column_config.NumberColumn("Last", format="%.2f"),
-                "Buy low": st.column_config.NumberColumn("Buy low", format="%.2f"),
-                "Buy high": st.column_config.NumberColumn("Buy high", format="%.2f"),
-                "Day Δ %": st.column_config.NumberColumn("Day Δ %", format="%.2f"),
-                "Δ to buy low %": st.column_config.NumberColumn("Δ to buy low %", format="%.2f"),
-                "Blended": st.column_config.NumberColumn("Blended", format="%.3f"),
-                "Tech": st.column_config.NumberColumn("Tech", format="%.2f"),
-                "Fund": st.column_config.NumberColumn("Fund", format="%.2f"),
-                "Sent": st.column_config.NumberColumn("Sent", format="%.2f"),
-                "Market": st.column_config.NumberColumn("Market", format="%.2f"),
-                "Sess": st.column_config.NumberColumn("Sess", format="%.2f"),
-                "R:R": st.column_config.NumberColumn("R:R", format="%.2f"),
-                "R:R label": st.column_config.TextColumn("R:R label"),
-                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-                "Pre %": st.column_config.NumberColumn("Pre %", format="%.2f"),
-                "AH %": st.column_config.NumberColumn("AH %", format="%.2f"),
-                "Buy lean": st.column_config.NumberColumn("Buy lean", format="%.3f"),
+                "Last": st.column_config.NumberColumn("Last", format="%.2f", help=guide["Last"]["meaning"]),
+                "Buy low": st.column_config.NumberColumn("Buy low", format="%.2f", help=guide["Buy low"]["meaning"]),
+                "Buy high": st.column_config.NumberColumn("Buy high", format="%.2f", help=guide["Buy high"]["meaning"]),
+                "Day Δ %": st.column_config.NumberColumn("Day Δ %", format="%.2f", help=guide["Day Δ %"]["meaning"]),
+                "Δ to buy low %": st.column_config.NumberColumn(
+                    "Δ to buy low %", format="%.2f", help=guide["Δ to buy low %"]["meaning"]
+                ),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f", help=guide["RSI"]["meaning"]),
+                "Blended": st.column_config.NumberColumn("Blended", format="%.3f", help=guide["Blended"]["meaning"]),
+                "Tech": st.column_config.NumberColumn("Tech", format="%.2f", help=guide["Tech"]["meaning"]),
+                "Fund": st.column_config.NumberColumn("Fund", format="%.2f", help=guide["Fund"]["meaning"]),
+                "Sent": st.column_config.NumberColumn("Sent", format="%.2f", help=guide["Sent"]["meaning"]),
+                "Market": st.column_config.NumberColumn("Market", format="%.2f", help=guide["Market"]["meaning"]),
+                "Sess": st.column_config.NumberColumn("Sess", format="%.2f", help=guide["Sess"]["meaning"]),
+                "R:R": st.column_config.NumberColumn("R:R", format="%.2f", help=guide["R:R"]["meaning"]),
+                "R:R label": st.column_config.TextColumn("R:R label", help=guide["R:R label"]["meaning"]),
+                "Pre %": st.column_config.NumberColumn("Pre %", format="%.2f", help=guide["Pre %"]["meaning"]),
+                "AH %": st.column_config.NumberColumn("AH %", format="%.2f", help=guide["AH %"]["meaning"]),
+                "Buy lean": st.column_config.NumberColumn("Buy lean", format="%.3f", help=guide["Buy lean"]["meaning"]),
             },
         )
 
