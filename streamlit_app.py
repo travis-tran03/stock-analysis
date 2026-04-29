@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+from supabase import Client, create_client
 
 from backend.analysis_runner import run_analyze
+
+WATCHLISTS_PATH = Path(__file__).with_name("watchlists.json")
+SUPABASE_TABLE = "watchlist_groups"
 
 
 def _num(v: Any) -> float:
@@ -290,6 +296,87 @@ def parse_tickers(text: str) -> list[str]:
     return out
 
 
+def load_watchlists() -> dict[str, list[str]]:
+    """Load saved watchlist groups from disk."""
+    if not WATCHLISTS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(WATCHLISTS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    cleaned: dict[str, list[str]] = {}
+    for name, values in raw.items():
+        if not isinstance(name, str) or not isinstance(values, list):
+            continue
+        tickers = parse_tickers(",".join(str(v) for v in values))
+        if tickers:
+            cleaned[name.strip()] = tickers
+    return cleaned
+
+
+def _get_supabase_client() -> Optional[Client]:
+    """Create Supabase client from Streamlit secrets, if configured."""
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+    except Exception:
+        return None
+    if not url or not key:
+        return None
+    try:
+        return create_client(str(url), str(key))
+    except Exception:
+        return None
+
+
+def load_watchlists_from_supabase(client: Client) -> dict[str, list[str]]:
+    """Load watchlist groups from Supabase table."""
+    data = client.table(SUPABASE_TABLE).select("group_name,symbols").execute().data or []
+    out: dict[str, list[str]] = {}
+    for row in data:
+        name = str(row.get("group_name") or "").strip()
+        symbols = row.get("symbols") or []
+        if not name or not isinstance(symbols, list):
+            continue
+        tickers = parse_tickers(",".join(str(v) for v in symbols))
+        if tickers:
+            out[name] = tickers
+    return out
+
+
+def save_watchlists(watchlists: dict[str, list[str]]) -> None:
+    """Persist watchlist groups to disk."""
+    payload = {k: v for k, v in sorted(watchlists.items()) if k and v}
+    WATCHLISTS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def save_watchlists_to_supabase(client: Client, watchlists: dict[str, list[str]]) -> None:
+    """Persist all watchlist groups to Supabase table."""
+    payload = [
+        {"group_name": name, "symbols": symbols}
+        for name, symbols in sorted(watchlists.items())
+        if name and symbols
+    ]
+    client.table(SUPABASE_TABLE).delete().neq("group_name", "").execute()
+    if payload:
+        client.table(SUPABASE_TABLE).insert(payload).execute()
+
+
+def persist_watchlists(client: Optional[Client], watchlists: dict[str, list[str]]) -> None:
+    """Save to Supabase when configured; otherwise to local file."""
+    if client is not None:
+        try:
+            save_watchlists_to_supabase(client, watchlists)
+            return
+        except Exception:
+            # Fallback keeps feature usable if remote persistence temporarily fails.
+            pass
+    save_watchlists(watchlists)
+
+
 def direction_badge(direction: str) -> str:
     """HTML span with color for BUY / SELL / HOLD."""
     colors = {
@@ -320,14 +407,93 @@ def main() -> None:
         "(no separate API server required)."
     )
 
+    supabase_client = _get_supabase_client()
+    using_supabase = supabase_client is not None
+
+    if "watchlists" not in st.session_state:
+        if using_supabase:
+            try:
+                st.session_state.watchlists = load_watchlists_from_supabase(supabase_client)
+            except Exception:
+                st.session_state.watchlists = load_watchlists()
+        else:
+            st.session_state.watchlists = load_watchlists()
+    if "ticker_input" not in st.session_state:
+        st.session_state.ticker_input = "TSLA, AAPL, NVDA"
+
+    with st.sidebar:
+        st.subheader("Watchlist groups")
+        st.caption(f"Storage: {'Supabase' if using_supabase else 'Local file'}")
+        groups = sorted(st.session_state.watchlists.keys())
+        new_group_name = st.text_input(
+            "Create new group",
+            placeholder="e.g. AI Leaders, Dividend Watch, Swing Setups",
+        )
+        if st.button("Create group", use_container_width=True):
+            name = new_group_name.strip()
+            if not name:
+                st.warning("Enter a group name.")
+            elif name in st.session_state.watchlists:
+                st.warning("That group already exists.")
+            else:
+                st.session_state.watchlists[name] = []
+                persist_watchlists(supabase_client, st.session_state.watchlists)
+                st.success(f"Created {name}")
+                st.rerun()
+
+        st.markdown("---")
+        selected_group = st.selectbox(
+            "Select group",
+            options=groups if groups else ["(none yet)"],
+            disabled=not groups,
+            key="selected_watchlist_group",
+        )
+        if groups:
+            current_symbols = st.session_state.watchlists.get(selected_group, [])
+            st.caption("Symbols in selected group")
+            st.code(", ".join(current_symbols) if current_symbols else "(no symbols yet)")
+
+            add_symbols = st.text_input(
+                "Add ticker symbols to selected group",
+                placeholder="e.g. MSFT, GOOGL, AMD",
+            )
+            a1, a2 = st.columns(2)
+            if a1.button("Add symbols", use_container_width=True):
+                added = parse_tickers(add_symbols)
+                if not added:
+                    st.warning("Enter at least one valid ticker.")
+                else:
+                    merged = parse_tickers(",".join(current_symbols + added))
+                    st.session_state.watchlists[selected_group] = merged
+                    persist_watchlists(supabase_client, st.session_state.watchlists)
+                    st.success(f"Updated {selected_group} ({len(merged)} symbols)")
+                    st.rerun()
+            if a2.button("Delete group", use_container_width=True):
+                del st.session_state.watchlists[selected_group]
+                persist_watchlists(supabase_client, st.session_state.watchlists)
+                st.rerun()
+
+            if st.button("Load group into analyzer", use_container_width=True):
+                st.session_state.ticker_input = ", ".join(current_symbols)
+                st.success(f"Loaded {selected_group}")
+
+            if st.button("Analyze selected group", use_container_width=True):
+                st.session_state.ticker_input = ", ".join(current_symbols)
+                st.session_state.run_group_analysis = True
+                st.rerun()
+
     raw = st.text_area(
         "Tickers (comma or line separated)",
-        value="TSLA, AAPL, NVDA",
+        key="ticker_input",
         height=100,
         placeholder="e.g. TSLA, AAPL, NVDA",
     )
 
-    if st.button("Analyze", type="primary"):
+    run_group_analysis = bool(st.session_state.get("run_group_analysis"))
+    if run_group_analysis:
+        st.session_state.run_group_analysis = False
+
+    if st.button("Analyze", type="primary") or run_group_analysis:
         tickers = parse_tickers(raw)
         if not tickers:
             st.warning("Enter at least one ticker.")
