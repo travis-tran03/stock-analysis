@@ -104,55 +104,85 @@ def _compare_column_guide() -> dict[str, dict[str, str]]:
     """
     return {
         "Ticker": {"meaning": "Stock symbol."},
-        "Direction": {"meaning": "Model trade lean from blended score.", "good": "BUY / SELL when supported by other columns."},
-        "Confidence": {"meaning": "How confident the model is (0–100%).", "good": "70%+ strong, 50–70% moderate, <40% weak."},
-        "Last": {"meaning": "Last regular-session close.", "good": "Contextual (compare vs entry range)."},
-        "Buy low": {"meaning": "Suggested lower bound of entry zone.", "good": "For BUY: last near/under this is favorable."},
-        "Buy high": {"meaning": "Suggested upper bound of entry zone.", "good": "For BUY: last below this is generally better than above."},
+        "Direction": {
+            "meaning": "Model trade lean from blended score.",
+            "good": "BUY = strongest long setup; HOLD = wait/neutral; SELL = wait for deeper discount (long-only mode).",
+        },
+        "Confidence": {
+            "meaning": "How confident the model is (0–100%).",
+            "good": "Strong: >=70 | Moderate: 50-69 | Weak: <50.",
+        },
+        "Last": {
+            "meaning": "Last regular-session close.",
+            "good": "No fixed universal range; compare against Buy low/Buy high/Sell for context.",
+        },
+        "Buy low": {
+            "meaning": "Suggested lower bound of entry zone.",
+            "good": "No fixed universal range; closer to current Last means sooner fill, farther below means more patience needed.",
+        },
+        "Buy high": {
+            "meaning": "Suggested upper bound of entry zone.",
+            "good": "No fixed universal range; if Last <= Buy high, entry is currently in-range.",
+        },
         "Sell": {
-            "meaning": "Suggested first take-profit level (TP1). For BUY this is a sell target; for SELL this is a buy-to-cover target.",
-            "good": "Contextual—use with R:R. Farther in your favor increases R:R, but may be less likely to hit.",
+            "meaning": "Suggested first take-profit level (TP1). In long-only mode this is a sell target for both BUY and SELL signals (SELL means buy lower, then sell rebound).",
+            "good": "No fixed universal range; should typically be above entry zone for a valid long setup.",
         },
         "Day Δ %": {
             "meaning": "1-day % change (close vs prior close).",
-            "good": "For BUY: ≤ 0% good, 0% to +1.5% ok, > +1.5% stretched. For SELL: ≥ 0% good, 0% to −1.5% ok, < −1.5% stretched.",
+            "good": "Strong: >=+1.5 | Neutral: 0 to +1.49 | Weak: <0.",
         },
         "Δ to buy low %": {
             "meaning": "Percent move from last price down to the suggested entry low (typically negative).",
-            "good": "For BUY: ~0% to −1% great, −1% to −3% ok, <−5% far away.",
+            "good": "Strong: >=-1% | OK: -3% to -1% | Weak: <-3%. (Higher/closer to 0 is better.)",
         },
-        "RSI": {"meaning": "RSI(14).", "good": "For BUY: <45 favorable (esp <30). For SELL: >55 favorable (esp >70)."},
+        "RSI": {
+            "meaning": "RSI(14).",
+            "good": "Strong: >=60 | OK: 45-59 | Weak: <45.",
+        },
         "Blended": {
             "meaning": "Weighted score combining Tech/Fund/Sent/Market/Sess (range ~[-1, 1]).",
-            "good": "BUY if ≥ +0.18, SELL if ≤ −0.18 (stronger magnitude is better).",
+            "good": "Strong: >=+0.18 | OK: +0.08 to +0.179 | Weak: <+0.08.",
         },
         "Tech": {
             "meaning": "Technical sub-score (~[-1, 1]).",
-            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+            "good": "Strong: >=+0.22 | OK: +0.08 to +0.219 | Weak: <+0.08.",
         },
         "Fund": {
             "meaning": "Fundamental sub-score (~[-1, 1]).",
-            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+            "good": "Strong: >=+0.22 | OK: +0.08 to +0.219 | Weak: <+0.08.",
         },
         "Sent": {
             "meaning": "News sentiment sub-score (~[-1, 1]).",
-            "good": "For BUY: ≥ +0.22 strong, +0.08 to +0.22 ok, < +0.08 weak. For SELL: ≤ −0.22 strong, −0.22 to −0.08 ok, > −0.08 weak.",
+            "good": "Strong: >=+0.22 | OK: +0.08 to +0.219 | Weak: <+0.08.",
         },
         "Market": {
             "meaning": "Broad market context score (SPY/VIX) (~[-1, 1]).",
-            "good": "For BUY: ≥ +0.22 supportive, +0.08 to +0.22 mildly supportive, < +0.08 neutral/against. For SELL: ≤ −0.22 supportive, −0.22 to −0.08 mildly supportive, > −0.08 neutral/against.",
+            "good": "Strong: >=+0.22 | OK: +0.08 to +0.219 | Weak: <+0.08.",
         },
         "Sess": {
             "meaning": "Extended-hours session score (~[-1, 1]).",
-            "good": "For BUY: ≥ +0.22 supportive, +0.08 to +0.22 mildly supportive, < +0.08 neutral/against. For SELL: ≤ −0.22 supportive, −0.22 to −0.08 mildly supportive, > −0.08 neutral/against.",
+            "good": "Strong: >=+0.22 | OK: +0.08 to +0.219 | Weak: <+0.08.",
         },
-        "R:R": {"meaning": "Estimated risk/reward ratio for the plan.", "good": "≥2.0 great, 1.3–2.0 ok, <1.3 weak."},
-        "R:R label": {"meaning": "Text label for risk/reward.", "good": "Higher is better (or 'wait for clarity' on HOLD)."},
-        "Pre %": {"meaning": "Pre-market % change vs prior regular close.", "good": "Aligned with direction is supportive; big moves (>|3%|) deserve caution."},
-        "AH %": {"meaning": "After-hours % change vs regular close.", "good": "Aligned with direction is supportive; big moves (>|3%|) deserve caution."},
+        "R:R": {
+            "meaning": "Estimated risk/reward ratio for the plan.",
+            "good": "Strong: >=2.0 | OK: 1.3-1.99 | Weak: <1.3.",
+        },
+        "R:R label": {
+            "meaning": "Text label for risk/reward.",
+            "good": "Higher ratio is better; 'wait for clarity' means no strong setup yet.",
+        },
+        "Pre %": {
+            "meaning": "Pre-market % change vs prior regular close.",
+            "good": "Strong: >=+1.5% | Neutral: 0% to +1.49% | Weak: <0%.",
+        },
+        "AH %": {
+            "meaning": "After-hours % change vs regular close.",
+            "good": "Strong: >=+1.5% | Neutral: 0% to +1.49% | Weak: <0%.",
+        },
         "Buy lean": {
             "meaning": "BUY-only: blended × confidence (higher = stronger BUY conviction).",
-            "good": "For BUY: ≥ 0.16 strong, 0.12–0.16 ok, < 0.12 weak; blank/NaN for non-BUY rows.",
+            "good": "Strong: >=0.16 | OK: 0.12-0.159 | Weak: <0.12. Blank for non-BUY rows.",
         },
     }
 
@@ -175,7 +205,6 @@ def _style_compare_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     RED = "#fee2e2"     # red-100
 
     def row_style(row: pd.Series) -> list[str]:
-        direction = str(row.get("Direction") or "HOLD").upper()
         out = [""] * len(row)
         idx = {c: i for i, c in enumerate(row.index)}
 
@@ -190,82 +219,54 @@ def _style_compare_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             except Exception:
                 return float("nan")
 
-        # Directional interpretation helpers (scores in [-1, 1])
-        sign = 1.0 if direction == "BUY" else (-1.0 if direction == "SELL" else 0.0)
-
         # Confidence (0-100)
         conf = f("Confidence")
         if pd.notna(conf):
             set_cell("Confidence", "g" if conf >= 70 else ("y" if conf >= 50 else "r"))
 
-        # Blended score
+        # Blended score (higher is better)
         blended = f("Blended")
         if pd.notna(blended):
-            if direction == "BUY":
-                set_cell("Blended", "g" if blended >= 0.18 else ("y" if blended >= 0.05 else "r"))
-            elif direction == "SELL":
-                set_cell("Blended", "g" if blended <= -0.18 else ("y" if blended <= -0.05 else "r"))
-            else:
-                set_cell("Blended", "y" if abs(blended) >= 0.12 else "")
+            set_cell("Blended", "g" if blended >= 0.18 else ("y" if blended >= 0.08 else "r"))
 
-        # Δ to buy low % (closer to 0 is better for BUY; typically negative)
+        # Δ to buy low %: closer to 0 is better
         dlow = f("Δ to buy low %")
         if pd.notna(dlow):
-            if direction == "BUY":
-                # Example: -0.5% (great), -2% (ok), -6% (far).
-                set_cell("Δ to buy low %", "g" if dlow >= -1.0 else ("y" if dlow >= -3.0 else "r"))
-            else:
-                set_cell("Δ to buy low %", "y" if dlow >= -1.0 else "")
+            ad = abs(dlow)
+            set_cell("Δ to buy low %", "g" if ad <= 1.0 else ("y" if ad <= 3.0 else "r"))
 
-        # RSI (14)
+        # RSI (14): higher is better for long-only momentum view
         rsi = f("RSI")
         if pd.notna(rsi):
-            if direction == "BUY":
-                set_cell("RSI", "g" if rsi < 45 else ("y" if rsi < 55 else "r"))
-                if rsi < 30:
-                    set_cell("RSI", "g")
-            elif direction == "SELL":
-                set_cell("RSI", "g" if rsi > 55 else ("y" if rsi > 45 else "r"))
-                if rsi > 70:
-                    set_cell("RSI", "g")
-            else:
-                set_cell("RSI", "y" if (rsi < 35 or rsi > 65) else "")
+            set_cell("RSI", "g" if rsi >= 60 else ("y" if rsi >= 45 else "r"))
 
-        # Subscores Tech/Fund/Sent/Market/Sess: prefer aligned sign with decent magnitude
+        # Subscores Tech/Fund/Sent/Market/Sess: higher is better
         for col in ("Tech", "Fund", "Sent", "Market", "Sess"):
             v = f(col)
-            if pd.isna(v) or sign == 0.0:
+            if pd.isna(v):
                 continue
-            aligned = v * sign
-            set_cell(col, "g" if aligned >= 0.22 else ("y" if aligned >= 0.08 else "r"))
+            set_cell(col, "g" if v >= 0.22 else ("y" if v >= 0.08 else "r"))
 
         # Risk/Reward
         rr = f("R:R")
         if pd.notna(rr):
             set_cell("R:R", "g" if rr >= 2.0 else ("y" if rr >= 1.3 else "r"))
 
-        # Day Δ %: mild directional tint
+        # Day Δ %: higher is better
         day = f("Day Δ %")
         if pd.notna(day):
-            if direction == "BUY":
-                set_cell("Day Δ %", "g" if day <= 0.0 else ("y" if day <= 1.5 else "r"))
-            elif direction == "SELL":
-                set_cell("Day Δ %", "g" if day >= 0.0 else ("y" if day >= -1.5 else "r"))
+            set_cell("Day Δ %", "g" if day >= 1.5 else ("y" if day >= 0.0 else "r"))
 
-        # Extended session moves: big adverse moves red, aligned moves green
+        # Extended session moves: higher is better
         for col in ("Pre %", "AH %"):
             v = f(col)
-            if pd.isna(v) or sign == 0.0:
+            if pd.isna(v):
                 continue
-            if abs(v) >= 3.0 and (v * sign) < 0:
-                set_cell(col, "r")
-            elif abs(v) >= 1.5 and (v * sign) > 0:
-                set_cell(col, "g")
+            set_cell(col, "g" if v >= 1.5 else ("y" if v >= 0.0 else "r"))
 
-        # Buy lean (only meaningful for BUY)
+        # Buy lean score (only present for BUY rows)
         bl = f("Buy lean")
-        if pd.notna(bl) and direction == "BUY":
-            # Example: blended 0.18 with 70% confidence => 0.126 (solid "ok").
+        if pd.notna(bl):
             set_cell("Buy lean", "g" if bl >= 0.16 else ("y" if bl >= 0.12 else "r"))
 
         return out
