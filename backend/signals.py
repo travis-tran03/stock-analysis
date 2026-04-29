@@ -27,6 +27,8 @@ WT_SESSION = 0.10
 
 BUY_THRESHOLD = 0.18
 SELL_THRESHOLD = -0.18
+MAX_EXT_HOURS_ENTRY_SHIFT_PCT = 0.08
+MAX_EXT_HOURS_TP1_SHIFT_PCT = 0.12
 
 
 def _combined_score(
@@ -51,6 +53,36 @@ def _direction_from_score(s: float) -> TradeDirection:
     if s <= SELL_THRESHOLD:
         return TradeDirection.SELL
     return TradeDirection.HOLD
+
+
+def _cap_ext_hours_levels(
+    entry: Optional[float],
+    stop: Optional[float],
+    tps: list[float],
+    reference_price: Optional[float],
+) -> tuple[Optional[float], Optional[float], list[float]]:
+    """Keep extended-hours-derived levels within sane bounds vs reference price."""
+    if reference_price is None or reference_price <= 0:
+        return entry, stop, tps
+
+    lo_entry = reference_price * (1.0 - MAX_EXT_HOURS_ENTRY_SHIFT_PCT)
+    hi_entry = reference_price * (1.0 + MAX_EXT_HOURS_ENTRY_SHIFT_PCT)
+    lo_tp = reference_price * (1.0 - MAX_EXT_HOURS_TP1_SHIFT_PCT)
+    hi_tp = reference_price * (1.0 + MAX_EXT_HOURS_TP1_SHIFT_PCT)
+
+    capped_entry = entry
+    if capped_entry is not None:
+        capped_entry = max(lo_entry, min(hi_entry, float(capped_entry)))
+
+    capped_stop = stop
+    if capped_stop is not None:
+        capped_stop = max(lo_tp, min(hi_tp, float(capped_stop)))
+
+    capped_tps: list[float] = []
+    for tp in tps:
+        capped_tps.append(max(lo_tp, min(hi_tp, float(tp))))
+
+    return capped_entry, capped_stop, capped_tps
 
 
 def _confidence_from_score(s: float, has_fundamentals: bool, news_count: int) -> float:
@@ -214,6 +246,7 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     ss = sentiment_score(sent)
     comb = _combined_score(ts, fs, ss, ms, es)
     direction = _direction_from_score(comb)
+    final_direction = direction
 
     has_fund = fund.pe_ratio is not None or fund.eps_ttm is not None
     conf = _confidence_from_score(comb, has_fund, sent.headline_count)
@@ -270,7 +303,14 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
                 premkt=premarket_analysis,
             )
             if not wait_open and adj_entry is not None and adj_stop is not None and adj_tps:
-                final_range, final_entry, stop, tps, rr = adj_range, adj_entry, adj_stop, adj_tps, adj_rr
+                capped_entry, capped_stop, capped_tps = _cap_ext_hours_levels(adj_entry, adj_stop, adj_tps, price)
+                if capped_entry is not None and capped_stop is not None and capped_tps:
+                    width = max(0.0, float(adj_range.high) - float(adj_range.low))
+                    half_w = width / 2.0
+                    final_range = EntryRange(low=round(capped_entry - half_w, 4), high=round(capped_entry + half_w, 4))
+                    final_entry, stop, tps, rr = capped_entry, capped_stop, capped_tps, adj_rr
+                    if implied_dir != direction:
+                        final_direction = implied_dir
             if premarket_analysis.premarket_signal == "WEAK":
                 conf = float(max(0.1, min(0.95, conf * 0.92)))
             elif premarket_analysis.premarket_signal == "STRONG":
@@ -291,7 +331,14 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
                 aft=afterhours_analysis,
             )
             if not wait_post and adj_entry is not None and adj_stop is not None and adj_tps:
-                final_range, final_entry, stop, tps, rr = adj_range, adj_entry, adj_stop, adj_tps, adj_rr
+                capped_entry, capped_stop, capped_tps = _cap_ext_hours_levels(adj_entry, adj_stop, adj_tps, price)
+                if capped_entry is not None and capped_stop is not None and capped_tps:
+                    width = max(0.0, float(adj_range.high) - float(adj_range.low))
+                    half_w = width / 2.0
+                    final_range = EntryRange(low=round(capped_entry - half_w, 4), high=round(capped_entry + half_w, 4))
+                    final_entry, stop, tps, rr = capped_entry, capped_stop, capped_tps, adj_rr
+                    if implied_dir != direction:
+                        final_direction = implied_dir
             if afterhours_analysis.afterhours_signal == "WEAK":
                 conf = float(max(0.1, min(0.95, conf * 0.92)))
             elif afterhours_analysis.afterhours_signal == "STRONG":
@@ -323,6 +370,8 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         f"Entry vs market: ATR scale ×{bm:.2f}, extra dip room +{lx:.2f}×ATR (weak tape / VIX / vol)"
     )
     summary_points.append(sess.get("summary") or "Extended hours: n/a")
+    if final_direction != direction:
+        summary_points.append(f"Direction override from {direction.value} to {final_direction.value} due to significant extended-hours move.")
     if premarket_analysis and premarket_analysis.premarket_change_percent is not None:
         summary_points.append(f"Pre-market change vs prev close: {premarket_analysis.premarket_change_percent:+.2f}% ({premarket_analysis.premarket_signal})")
     if afterhours_analysis and afterhours_analysis.afterhours_change_percent is not None:
@@ -331,7 +380,7 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     rationale = (
         f"Blended score {comb:.2f} (tech {ts:.2f}, fund {fs:.2f}, sent {ss:.2f}, "
         f"market {ms:.2f}, session {es:.2f}). "
-        f"Direction {direction.value} with confidence {conf:.0%}."
+        f"Direction {final_direction.value} with confidence {conf:.0%}."
     )
 
     triggers: list[str] = []
@@ -399,7 +448,7 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
 
     return StockAnalysis(
         ticker=data.ticker,
-        direction=direction,
+        direction=final_direction,
         confidence=conf,
         entry_range=final_range,
         entry_price=final_entry,
