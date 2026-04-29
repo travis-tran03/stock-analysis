@@ -29,6 +29,11 @@ BUY_THRESHOLD = 0.18
 SELL_THRESHOLD = -0.18
 MAX_EXT_HOURS_ENTRY_SHIFT_PCT = 0.08
 MAX_EXT_HOURS_TP1_SHIFT_PCT = 0.12
+MAX_LEVEL_MOD_SHIFT = 0.18
+EXT_HOURS_SIGNIFICANT_MOVE_PCT = 4.0
+EXT_HOURS_STRONG_MOVE_PCT = 6.0
+EXT_HOURS_MIN_BLEND = 0.10
+EXT_HOURS_MAX_BLEND = 0.35
 
 
 def _combined_score(
@@ -83,6 +88,238 @@ def _cap_ext_hours_levels(
         capped_tps.append(max(lo_tp, min(hi_tp, float(tp))))
 
     return capped_entry, capped_stop, capped_tps
+
+
+def _blend_scalar(a: Optional[float], b: Optional[float], w: float) -> Optional[float]:
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (1.0 - w) * float(a) + w * float(b)
+
+
+def _ext_hours_blend_weight(
+    change_pct: Optional[float],
+    session_signal: Optional[str],
+    combined_score: float,
+) -> float:
+    """Map extended-hours confidence to a bounded influence weight."""
+    if change_pct is None:
+        return 0.0
+    mag = abs(float(change_pct))
+    # Magnitude scaled around 4%-8% band.
+    mag_norm = max(0.0, min(1.0, (mag - EXT_HOURS_SIGNIFICANT_MOVE_PCT) / 4.0))
+    w = EXT_HOURS_MIN_BLEND + (EXT_HOURS_MAX_BLEND - EXT_HOURS_MIN_BLEND) * mag_norm
+
+    sig = (session_signal or "").upper()
+    if sig == "WEAK":
+        w *= 0.55
+    elif sig == "NEUTRAL":
+        w *= 0.80
+    elif sig == "STRONG":
+        w *= 1.00
+
+    # If regular blended score is already directional, reduce ext-hours dominance.
+    if abs(combined_score) >= 0.18:
+        w *= 0.70
+
+    return float(max(0.0, min(EXT_HOURS_MAX_BLEND, w)))
+
+
+def _should_override_direction(
+    current: TradeDirection,
+    implied: TradeDirection,
+    change_pct: Optional[float],
+    session_signal: Optional[str],
+    combined_score: float,
+) -> bool:
+    """Conservative override: only when ext-hours signal is strong and core score is near-neutral."""
+    if implied == current:
+        return False
+    if current != TradeDirection.HOLD:
+        return False
+    if change_pct is None or abs(float(change_pct)) < EXT_HOURS_STRONG_MOVE_PCT:
+        return False
+    if (session_signal or "").upper() != "STRONG":
+        return False
+    # Only override HOLD when core model is near neutral.
+    return abs(combined_score) <= 0.12
+
+
+def _conviction_strength(
+    direction: TradeDirection,
+    combined: float,
+    tech_s: float,
+    fund_s: float,
+    sent_s: float,
+    market_s: float,
+    session_s: float,
+    rsi_14: Optional[float],
+) -> float:
+    """Return 0..1 confidence that levels can be more aggressive for this direction."""
+    sign = 1.0 if direction == TradeDirection.BUY else (-1.0 if direction == TradeDirection.SELL else 0.0)
+    if sign == 0.0:
+        return 0.5
+
+    aligned = [
+        combined * sign,
+        tech_s * sign,
+        fund_s * sign,
+        sent_s * sign,
+        market_s * sign,
+        session_s * sign,
+    ]
+    # Map average aligned score to [0,1] with conservative bounds.
+    avg_aligned = sum(aligned) / len(aligned)
+    base = (max(-0.35, min(0.35, avg_aligned)) + 0.35) / 0.70
+
+    # RSI tilt: supportive RSI adds conviction, adverse RSI reduces.
+    rsi_adj = 0.0
+    if rsi_14 is not None:
+        if direction == TradeDirection.BUY:
+            if rsi_14 < 35:
+                rsi_adj += 0.08
+            elif rsi_14 > 68:
+                rsi_adj -= 0.10
+        elif direction == TradeDirection.SELL:
+            if rsi_14 > 65:
+                rsi_adj += 0.08
+            elif rsi_14 < 32:
+                rsi_adj -= 0.10
+
+    return float(max(0.0, min(1.0, base + rsi_adj)))
+
+
+def _apply_level_modifiers(
+    direction: TradeDirection,
+    entry_range: EntryRange,
+    entry_price: Optional[float],
+    stop: Optional[float],
+    take_profits: list[float],
+    price: float,
+    atr: Optional[float],
+    conviction: float,
+) -> tuple[EntryRange, Optional[float], Optional[float], list[float], RiskReward]:
+    """
+    Nudge levels using conviction while preserving structure:
+    - stronger conviction => earlier entry + farther TP
+    - weaker conviction => more conservative entry + nearer TP
+    """
+    if direction not in (TradeDirection.BUY, TradeDirection.SELL):
+        rr = RiskReward(ratio=None, label="wait for clarity")
+        return entry_range, entry_price, stop, take_profits, rr
+
+    if entry_price is None or stop is None or not take_profits:
+        rr = RiskReward(ratio=None, label="n/a")
+        return entry_range, entry_price, stop, take_profits, rr
+
+    base_a = atr if atr and atr > 0 else price * 0.02
+    # conviction around 0.5 => neutral; below/above shifts up to MAX_LEVEL_MOD_SHIFT of ATR.
+    tilt = (conviction - 0.5) * 2.0
+    shift = max(-MAX_LEVEL_MOD_SHIFT, min(MAX_LEVEL_MOD_SHIFT, tilt)) * base_a
+
+    e = float(entry_price)
+    s = float(stop)
+    tps = [float(x) for x in take_profits]
+    low = float(entry_range.low) if entry_range.low is not None else e
+    high = float(entry_range.high) if entry_range.high is not None else e
+    width = max(0.0, high - low)
+    half_w = width / 2.0
+
+    if direction == TradeDirection.BUY:
+        # Stronger bullish conviction: accept slightly higher/earlier entry and aim farther TP.
+        e += shift
+        s += 0.4 * shift
+        tps = [tp + 0.8 * shift for tp in tps]
+    else:
+        # Stronger bearish conviction: accept slightly lower/earlier short entry and farther downside TP.
+        e -= shift
+        s -= 0.4 * shift
+        tps = [tp - 0.8 * shift for tp in tps]
+
+    # Keep entry range centered on adjusted entry, preserving prior width.
+    adj_range = EntryRange(low=round(e - half_w, 4), high=round(e + half_w, 4))
+
+    if direction == TradeDirection.BUY:
+        risk = e - s
+        reward = tps[0] - e
+    else:
+        risk = s - e
+        reward = e - tps[0]
+    rr_ratio = (reward / risk) if (risk > 0 and reward > 0) else None
+    rr = RiskReward(ratio=round(rr_ratio, 3) if rr_ratio is not None else None, label=f"~{rr_ratio:.2f}:1" if rr_ratio else "n/a")
+
+    return adj_range, round(e, 4), round(s, 4), [round(x, 4) for x in tps], rr
+
+
+def _long_only_levels_for_sell_signal(
+    price: float,
+    atr: Optional[float],
+    support: Optional[float],
+    resistance: Optional[float],
+    market_score: float,
+    vix_last: Optional[float],
+    conviction: float,
+    rsi_14: Optional[float],
+) -> tuple[EntryRange, Optional[float], Optional[float], list[float], RiskReward]:
+    """
+    Long-only interpretation for bearish signals:
+    seek a deeper pullback entry, then sell into rebound targets.
+    """
+    base_a = atr if atr and atr > 0 else price * 0.02
+    bm, _lx = _entry_market_adjustment(market_score, vix_last, atr, price)
+    a = base_a * bm
+
+    # Evidence-based guardrail:
+    # Pullback entries in volatile tapes are commonly around ~1.0–2.0 ATR from anchor,
+    # not extreme multi-ATR discounts.
+    desired_discount_atr = 1.0 + 0.55 * conviction + 0.25 * max(0.0, -market_score)
+    if rsi_14 is not None:
+        # If already very oversold, avoid demanding an even deeper discount.
+        if rsi_14 <= 30:
+            desired_discount_atr -= 0.18
+        elif rsi_14 >= 45:
+            desired_discount_atr += 0.10
+    desired_discount_atr = max(0.8, min(1.9, desired_discount_atr))
+
+    # Hard percentage cap to prevent unrealistic buy lows in large caps.
+    max_discount_pct = 0.07
+    discount_amt = min(desired_discount_atr * a, price * max_discount_pct)
+
+    center = price - discount_amt
+    half_width = max(0.18 * a, price * 0.006)
+    low = center - half_width
+    high = center + half_width
+
+    # Respect support structure but avoid setting entries too far below it.
+    if support is not None and support < price:
+        support_floor = support - 0.35 * a
+        support_ceiling = support + 0.25 * a
+        low = max(low, support_floor)
+        high = min(high, support_ceiling if support_ceiling > low else high)
+    if high <= low:
+        high = low + 0.25 * a
+
+    entry = (low + high) / 2.0
+    stop = low - 0.8 * a
+    tp1 = max(price, entry + 0.8 * a)
+    if resistance is not None and resistance > entry:
+        tp1 = min(tp1, resistance - 0.05 * a)
+        tp1 = max(tp1, entry + 0.6 * a)
+    tp2 = max(tp1 + 0.7 * a, min(price + 1.0 * a, entry + 2.0 * a))
+
+    risk = entry - stop
+    reward = tp1 - entry
+    rr = (reward / risk) if (risk and risk > 0 and reward > 0) else None
+    return (
+        EntryRange(low=round(low, 4), high=round(high, 4)),
+        round(entry, 4),
+        round(stop, 4),
+        [round(tp1, 4), round(tp2, 4)],
+        RiskReward(ratio=round(rr, 3) if rr is not None else None, label=f"~{rr:.2f}:1" if rr else "n/a"),
+    )
 
 
 def _confidence_from_score(s: float, has_fundamentals: bool, news_count: int) -> float:
@@ -277,6 +514,7 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     #     "conditional breakout" direction (gap up -> BUY breakout, gap down -> SELL breakdown).
     afterhours_analysis = None
 
+    ext_hours_influence = 0.0
     if data.extended_hours is not None:
         avg_vol = None
         try:
@@ -301,15 +539,30 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
                 resistance=res,
                 support=sup,
                 premkt=premarket_analysis,
+                significant_move_abs_pct=EXT_HOURS_SIGNIFICANT_MOVE_PCT,
             )
             if not wait_open and adj_entry is not None and adj_stop is not None and adj_tps:
                 capped_entry, capped_stop, capped_tps = _cap_ext_hours_levels(adj_entry, adj_stop, adj_tps, price)
                 if capped_entry is not None and capped_stop is not None and capped_tps:
-                    width = max(0.0, float(adj_range.high) - float(adj_range.low))
-                    half_w = width / 2.0
-                    final_range = EntryRange(low=round(capped_entry - half_w, 4), high=round(capped_entry + half_w, 4))
-                    final_entry, stop, tps, rr = capped_entry, capped_stop, capped_tps, adj_rr
-                    if implied_dir != direction:
+                    w = _ext_hours_blend_weight(premarket_analysis.premarket_change_percent, premarket_analysis.premarket_signal, comb)
+                    ext_hours_influence = max(ext_hours_influence, w)
+                    final_range = EntryRange(
+                        low=round(_blend_scalar(planned_range.low, adj_range.low, w) or planned_range.low or 0.0, 4),
+                        high=round(_blend_scalar(planned_range.high, adj_range.high, w) or planned_range.high or 0.0, 4),
+                    )
+                    final_entry = _blend_scalar(planned_entry, capped_entry, w)
+                    stop = _blend_scalar(stop, capped_stop, w)
+                    tps = [
+                        round(_blend_scalar(tps[i], capped_tps[i], w) or capped_tps[i], 4)
+                        for i in range(min(len(tps), len(capped_tps)))
+                    ]
+                    if _should_override_direction(
+                        current=direction,
+                        implied=implied_dir,
+                        change_pct=premarket_analysis.premarket_change_percent,
+                        session_signal=premarket_analysis.premarket_signal,
+                        combined_score=comb,
+                    ):
                         final_direction = implied_dir
             if premarket_analysis.premarket_signal == "WEAK":
                 conf = float(max(0.1, min(0.95, conf * 0.92)))
@@ -329,20 +582,68 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
                 resistance=res,
                 support=sup,
                 aft=afterhours_analysis,
+                significant_move_abs_pct=EXT_HOURS_SIGNIFICANT_MOVE_PCT,
             )
             if not wait_post and adj_entry is not None and adj_stop is not None and adj_tps:
                 capped_entry, capped_stop, capped_tps = _cap_ext_hours_levels(adj_entry, adj_stop, adj_tps, price)
                 if capped_entry is not None and capped_stop is not None and capped_tps:
-                    width = max(0.0, float(adj_range.high) - float(adj_range.low))
-                    half_w = width / 2.0
-                    final_range = EntryRange(low=round(capped_entry - half_w, 4), high=round(capped_entry + half_w, 4))
-                    final_entry, stop, tps, rr = capped_entry, capped_stop, capped_tps, adj_rr
-                    if implied_dir != direction:
+                    w = _ext_hours_blend_weight(afterhours_analysis.afterhours_change_percent, afterhours_analysis.afterhours_signal, comb)
+                    ext_hours_influence = max(ext_hours_influence, w)
+                    final_range = EntryRange(
+                        low=round(_blend_scalar(planned_range.low, adj_range.low, w) or planned_range.low or 0.0, 4),
+                        high=round(_blend_scalar(planned_range.high, adj_range.high, w) or planned_range.high or 0.0, 4),
+                    )
+                    final_entry = _blend_scalar(planned_entry, capped_entry, w)
+                    stop = _blend_scalar(stop, capped_stop, w)
+                    tps = [
+                        round(_blend_scalar(tps[i], capped_tps[i], w) or capped_tps[i], 4)
+                        for i in range(min(len(tps), len(capped_tps)))
+                    ]
+                    if _should_override_direction(
+                        current=direction,
+                        implied=implied_dir,
+                        change_pct=afterhours_analysis.afterhours_change_percent,
+                        session_signal=afterhours_analysis.afterhours_signal,
+                        combined_score=comb,
+                    ):
                         final_direction = implied_dir
             if afterhours_analysis.afterhours_signal == "WEAK":
                 conf = float(max(0.1, min(0.95, conf * 0.92)))
             elif afterhours_analysis.afterhours_signal == "STRONG":
                 conf = float(max(0.1, min(0.95, conf * 1.03)))
+
+    # Apply directional conviction + RSI to level aggressiveness.
+    conviction = _conviction_strength(
+        final_direction,
+        comb,
+        ts,
+        fs,
+        ss,
+        ms,
+        es,
+        tech.rsi_14,
+    )
+    final_range, final_entry, stop, tps, rr = _apply_level_modifiers(
+        final_direction,
+        final_range,
+        final_entry,
+        stop,
+        tps,
+        price,
+        atr,
+        conviction,
+    )
+    if final_direction == TradeDirection.SELL:
+        final_range, final_entry, stop, tps, rr = _long_only_levels_for_sell_signal(
+            price=price,
+            atr=atr,
+            support=sup,
+            resistance=res,
+            market_score=ms,
+            vix_last=vix_f,
+            conviction=conviction,
+            rsi_14=tech.rsi_14,
+        )
 
     summary_points: list[str] = []
     if tech.rsi_14 is not None:
@@ -369,6 +670,10 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     summary_points.append(
         f"Entry vs market: ATR scale ×{bm:.2f}, extra dip room +{lx:.2f}×ATR (weak tape / VIX / vol)"
     )
+    summary_points.append(f"Extended-hours influence weight: {ext_hours_influence:.2f} (capped; blended into planned levels).")
+    summary_points.append(f"Level conviction modifier: {conviction:.2f} (includes score alignment + RSI tilt).")
+    if final_direction == TradeDirection.SELL:
+        summary_points.append("Long-only mode: SELL means wait for a deeper buy entry, then sell into rebound targets.")
     summary_points.append(sess.get("summary") or "Extended hours: n/a")
     if final_direction != direction:
         summary_points.append(f"Direction override from {direction.value} to {final_direction.value} due to significant extended-hours move.")
@@ -382,6 +687,8 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
         f"market {ms:.2f}, session {es:.2f}). "
         f"Direction {final_direction.value} with confidence {conf:.0%}."
     )
+    if final_direction == TradeDirection.SELL:
+        rationale += " Long-only interpretation applied: no short plan; levels represent a lower buy zone and rebound exits."
 
     triggers: list[str] = []
     if tech.sma_200:
