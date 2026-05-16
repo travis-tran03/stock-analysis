@@ -15,6 +15,7 @@ from backend.premarket import (
     pick_helpful_extended_hours,
 )
 from backend.schemas import EntryRange, RiskReward, StockAnalysis, TradeDirection
+from backend.scoring_profiles import combined_for_horizon, direction_from_score
 from backend.sentiment import analyze_news_sentiment, sentiment_score
 from backend.technical import TechnicalSnapshot, compute_technicals, technical_score
 
@@ -482,6 +483,12 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
     fs = fundamental_score(fund)
     ss = sentiment_score(sent)
     comb = _combined_score(ts, fs, ss, ms, es)
+    long_score = combined_for_horizon("long", ts, fs, ss, ms, es)
+    short_score = combined_for_horizon("short", ts, fs, ss, ms, es)
+    horizon_direction = {
+        "long_term": direction_from_score(long_score),
+        "short_term": direction_from_score(short_score),
+    }
     direction = _direction_from_score(comb)
     final_direction = direction
 
@@ -735,7 +742,10 @@ def build_stock_analysis(data: FetchedStockData) -> StockAnalysis:
             "market": ms,
             "session": es,
             "combined": comb,
+            "long_term": long_score,
+            "short_term": short_score,
         },
+        "horizon_direction": horizon_direction,
         "entry_vs_market": {
             "atr_band_multiplier": round(float(bm), 4),
             "extra_low_atr_units": round(float(lx), 4),

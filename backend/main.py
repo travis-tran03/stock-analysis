@@ -6,7 +6,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.analysis_runner import run_analyze
-from backend.schemas import AnalyzeRequest, AnalyzeResponse
+from backend.recommendations import run_recommendations
+from backend.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    RecommendationsRequest,
+    RecommendationsResponse,
+)
 
 app = FastAPI(title="Stock Trade Analysis API", version="1.0.0")
 
@@ -33,3 +39,16 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/recommendations", response_model=RecommendationsResponse)
+def recommendations(req: RecommendationsRequest) -> RecommendationsResponse:
+    horizon = req.horizon.strip().lower()
+    if horizon not in ("long", "short"):
+        raise HTTPException(status_code=422, detail="horizon must be 'long' or 'short'")
+    return run_recommendations(
+        horizon=horizon,  # type: ignore[arg-type]
+        top_n=req.top_n,
+        min_confidence=req.min_confidence,
+        min_rr=req.min_rr,
+    )

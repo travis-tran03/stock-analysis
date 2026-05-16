@@ -2,6 +2,17 @@
 venv/
 env/
 
+# Analysis cache (recommendation scans)
+.cache/
+
+# Generated universe / scan caches (regenerated locally or on first deploy)
+data/universes/*.meta.json
+data/universes/short_term_index_candidates.txt
+data/universes/short_term_index_candidates.meta.json
+
+# Local watchlists (use Supabase on Cloud; file created at runtime)
+watchlists.json
+
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,9 +12,20 @@ import streamlit as st
 from supabase import Client, create_client
 
 from backend.analysis_runner import run_analyze
+from backend.index_constituents import major_index_universe_summary
+from backend.recommendations import (
+    finalize_recommendations,
+    process_ticker_for_recommendations,
+)
+from backend.schemas import RecommendationsResponse, StockAnalysis
+from backend.universe import get_universe, load_large_cap_universe, short_term_universe_summary
+
+REC_SCAN_STATE_KEY = "recommendation_scan"
+REC_SCAN_STOP_KEY = "recommendation_scan_stop"
 
 WATCHLISTS_PATH = Path(__file__).with_name("watchlists.json")
 SUPABASE_TABLE = "watchlist_groups"
+RECOMMENDATION_RUNS_TABLE = "recommendation_runs"
 
 
 def _num(v: Any) -> float:
@@ -365,6 +377,275 @@ def save_watchlists_to_supabase(client: Client, watchlists: dict[str, list[str]]
         client.table(SUPABASE_TABLE).insert(payload).execute()
 
 
+def load_recommendations_from_supabase(client: Client, horizon: str) -> Optional[dict[str, Any]]:
+    """Load most recent recommendation run for a horizon."""
+    try:
+        rows = (
+            client.table(RECOMMENDATION_RUNS_TABLE)
+            .select("results_json,created_at")
+            .eq("horizon", horizon)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        payload = row.get("results_json")
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            if row.get("created_at"):
+                payload["_supabase_created_at"] = row["created_at"]
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def save_recommendations_to_supabase(
+    client: Client, response: RecommendationsResponse
+) -> None:
+    client.table(RECOMMENDATION_RUNS_TABLE).insert(
+        {
+            "horizon": response.horizon,
+            "results_json": response.model_dump(mode="json"),
+        }
+    ).execute()
+
+
+def build_recommendations_dataframe(
+    picks: list[dict[str, Any]], score_label: str
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for pick in picks:
+        analysis = pick.get("analysis") or {}
+        det = analysis.get("details") or {}
+        tech = det.get("technical") or {}
+        scores = det.get("scores") or {}
+        rows.append(
+            {
+                "Ticker": pick.get("ticker"),
+                "Direction": pick.get("direction"),
+                "Confidence": float(pick.get("confidence") or 0) * 100.0,
+                score_label: _num(pick.get("horizon_score")),
+                "Rank": _num(pick.get("rank_score")),
+                "Last": _num(tech.get("last_close")),
+                "3mo %": _num(tech.get("momentum_3m_pct")),
+                "RSI": _num(tech.get("rsi_14")),
+                "Blended": _num(scores.get("combined")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _complete_recommendation_scan(
+    state: dict[str, Any],
+    supabase_client: Optional[Client],
+    *,
+    cancelled: bool,
+) -> None:
+    horizon = state["horizon"]
+    candidates: list[tuple[float, StockAnalysis]] = []
+    for item in state.get("candidates") or []:
+        candidates.append((float(item["rank"]), StockAnalysis.model_validate(item["analysis"])))
+
+    response = finalize_recommendations(
+        horizon=horizon,  # type: ignore[arg-type]
+        top_n=int(state["top_n"]),
+        universe_size=int(state.get("universe_size") or len(state.get("tickers") or [])),
+        candidates=candidates,
+        errors=list(state.get("errors") or []),
+        scanned_count=int(state.get("scanned") or 0),
+        cancelled=cancelled,
+    )
+    if cancelled:
+        response.errors = list(response.errors) + ["Scan stopped by user."]
+
+    session_key = state["session_key"]
+    st.session_state[session_key] = response.model_dump(mode="json")
+    if supabase_client is not None:
+        try:
+            save_recommendations_to_supabase(supabase_client, response)
+        except Exception as e:
+            st.warning(f"Could not save scan to Supabase: {e}")
+
+    st.session_state.pop(REC_SCAN_STATE_KEY, None)
+    st.session_state.pop(REC_SCAN_STOP_KEY, None)
+
+
+def _start_recommendation_scan(
+    horizon: str,
+    title: str,
+    session_key: str,
+    top_n: int,
+    min_confidence: float,
+) -> None:
+    if st.session_state.get(REC_SCAN_STATE_KEY):
+        st.warning("A scan is already in progress. Stop it or wait for it to finish.")
+        return
+    st.session_state[REC_SCAN_STATE_KEY] = {
+        "horizon": horizon,
+        "session_key": session_key,
+        "title": title,
+        "top_n": top_n,
+        "min_confidence": min_confidence,
+        "phase": "universe",
+        "tickers": [],
+        "i": 0,
+        "candidates": [],
+        "errors": [],
+        "scanned": 0,
+        "universe_size": 0,
+        "current_ticker": "",
+    }
+    st.session_state.pop(REC_SCAN_STOP_KEY, None)
+    st.rerun()
+
+
+def _handle_active_recommendation_scan(supabase_client: Optional[Client]) -> None:
+    """Advance an in-progress scan by one step (universe build or single ticker)."""
+    state = st.session_state.get(REC_SCAN_STATE_KEY)
+    if not state:
+        return
+
+    if st.session_state.get(REC_SCAN_STOP_KEY):
+        _complete_recommendation_scan(state, supabase_client, cancelled=True)
+        st.rerun()
+        return
+
+    horizon = state["horizon"]
+    title = state.get("title") or horizon
+
+    if state.get("phase") == "universe":
+        with st.spinner(f"Building universe for {title}…"):
+            tickers = get_universe(horizon)  # type: ignore[arg-type]
+        state["tickers"] = tickers
+        state["universe_size"] = len(tickers)
+        state["phase"] = "scan"
+        st.rerun()
+        return
+
+    tickers: list[str] = state.get("tickers") or []
+    i = int(state.get("i") or 0)
+    if i >= len(tickers):
+        _complete_recommendation_scan(state, supabase_client, cancelled=False)
+        st.rerun()
+        return
+
+    ticker = tickers[i]
+    state["current_ticker"] = ticker
+    candidate, err, counted = process_ticker_for_recommendations(
+        ticker,
+        horizon=horizon,  # type: ignore[arg-type]
+        min_confidence=float(state["min_confidence"]),
+    )
+    if counted:
+        state["scanned"] = int(state.get("scanned") or 0) + 1
+    if err:
+        state.setdefault("errors", []).append(err)
+    if candidate is not None:
+        rank, analysis = candidate
+        state.setdefault("candidates", []).append(
+            {"rank": rank, "analysis": analysis.model_dump(mode="json")}
+        )
+    state["i"] = i + 1
+    time.sleep(0.35)
+    st.rerun()
+
+
+def _render_active_scan_controls() -> bool:
+    """Show progress and Stop while a scan is running. Returns True if a scan is active."""
+    state = st.session_state.get(REC_SCAN_STATE_KEY)
+    if not state:
+        return False
+
+    title = state.get("title") or "Recommendation"
+    phase = state.get("phase") or "scan"
+    total = len(state.get("tickers") or [])
+    i = int(state.get("i") or 0)
+
+    st.markdown(f"**Scan in progress:** {title}")
+    if phase == "universe":
+        st.progress(0.0, text="Building ticker universe…")
+    else:
+        pct = i / max(total, 1)
+        current = state.get("current_ticker") or ""
+        st.progress(pct, text=f"Analyzing {i}/{total}: {current}")
+
+    if st.button("Stop scan", type="secondary", key="stop_rec_scan_global"):
+        st.session_state[REC_SCAN_STOP_KEY] = True
+        st.rerun()
+
+    return True
+
+
+def _render_recommendation_block(
+    horizon: str,
+    title: str,
+    caption: str,
+    score_label: str,
+    session_key: str,
+    supabase_client: Optional[Client],
+    top_n: int,
+    min_confidence: float,
+) -> None:
+    st.markdown(f"#### {title}")
+    st.caption(caption)
+
+    cached = st.session_state.get(session_key)
+    if cached:
+        as_of = cached.get("as_of") or cached.get("_supabase_created_at") or ""
+        stopped = " (stopped early)" if cached.get("cancelled") else ""
+        st.caption(
+            f"Last scan: {as_of} — scanned {cached.get('scanned_count', '?')} of "
+            f"{cached.get('universe_size', '?')}{stopped}"
+        )
+
+    scan_active = st.session_state.get(REC_SCAN_STATE_KEY) is not None
+    this_scan = (
+        scan_active
+        and st.session_state[REC_SCAN_STATE_KEY].get("session_key") == session_key
+    )
+    other_scan = scan_active and not this_scan
+
+    run_key = f"run_rec_{horizon}"
+    if st.button(
+        f"Run {title.lower()} scan",
+        key=run_key,
+        use_container_width=True,
+        disabled=scan_active,
+    ):
+        _start_recommendation_scan(horizon, title, session_key, top_n, min_confidence)
+    if other_scan:
+        st.caption("Another scan is running — use **Stop scan** above.")
+
+    cached = st.session_state.get(session_key)
+    if not cached:
+        st.info("No results yet. Run a scan to populate recommendations.")
+        return
+
+    if cached.get("cancelled"):
+        st.warning("Previous scan was stopped early — picks are from partial progress only.")
+
+    for err in cached.get("errors") or []:
+        st.warning(err)
+
+    picks = cached.get("picks") or []
+    if not picks:
+        st.info("No BUY picks matched your filters. Try lowering min confidence or re-run later.")
+        return
+
+    rec_df = build_recommendations_dataframe(picks, score_label)
+    st.dataframe(rec_df, use_container_width=True, hide_index=True)
+
+    tickers = ", ".join(str(p.get("ticker")) for p in picks if p.get("ticker"))
+    if st.button(f"Load {title} picks into analyzer", key=f"load_rec_{horizon}"):
+        st.session_state.ticker_input = tickers
+        st.rerun()
+
+
 def persist_watchlists(client: Optional[Client], watchlists: dict[str, list[str]]) -> None:
     """Save to Supabase when configured; otherwise to local file."""
     if client is not None:
@@ -420,6 +701,82 @@ def main() -> None:
             st.session_state.watchlists = load_watchlists()
     if "ticker_input" not in st.session_state:
         st.session_state.ticker_input = "TSLA, AAPL, NVDA"
+
+    if using_supabase and supabase_client is not None:
+        for hz, key in (("long", "rec_long"), ("short", "rec_short")):
+            if key not in st.session_state:
+                loaded = load_recommendations_from_supabase(supabase_client, hz)
+                if loaded:
+                    st.session_state[key] = loaded
+
+    st.subheader("Discover — stock recommendations")
+    st.caption(
+        "Automated heuristics for learning only, not financial advice. "
+        "Long-term scans major US indexes (S&P 500/400/600, NASDAQ-100, Dow); "
+        "Short-term scans the same major indexes, ranked by recent momentum. "
+        "First long scan can take 30+ minutes; short scan is a smaller subset (~200 names)."
+    )
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        rec_top_n = st.number_input("Top N picks", min_value=3, max_value=30, value=10, key="rec_top_n")
+    with d2:
+        rec_min_conf = st.slider(
+            "Min confidence",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.05,
+            key="rec_min_conf",
+        )
+    with d3:
+        st.caption("Scans run step-by-step; use **Stop scan** to cancel. Results cached 24h.")
+
+    if _render_active_scan_controls():
+        _handle_active_recommendation_scan(supabase_client if using_supabase else None)
+
+    col_long, col_short = st.columns(2)
+    with col_long:
+        try:
+            long_universe_n = len(load_large_cap_universe())
+            long_universe_desc = major_index_universe_summary()
+        except Exception:
+            long_universe_n = "?"
+            long_universe_desc = "S&P 500, S&P 400, S&P 600, NASDAQ-100, Dow 30"
+        _render_recommendation_block(
+            horizon="long",
+            title="Long-term growth",
+            caption=(
+                f"Universe: {long_universe_desc} — {long_universe_n} symbols to scan. "
+                "Scores favor fundamentals and market regime."
+            ),
+            score_label="Long score",
+            session_key="rec_long",
+            supabase_client=supabase_client if using_supabase else None,
+            top_n=int(rec_top_n),
+            min_confidence=float(rec_min_conf),
+        )
+    with col_short:
+        try:
+            short_universe_desc = short_term_universe_summary()
+        except Exception:
+            short_universe_desc = "Top momentum names from major US indexes"
+        _render_recommendation_block(
+            horizon="short",
+            title="Short-term growth",
+            caption=(
+                f"{short_universe_desc}. "
+                "Same indexes as long-term, filtered for 1–3 month price strength; "
+                "scores favor technicals, sentiment, and session."
+            ),
+            score_label="Short score",
+            session_key="rec_short",
+            supabase_client=supabase_client if using_supabase else None,
+            top_n=int(rec_top_n),
+            min_confidence=float(rec_min_conf),
+        )
+
+    st.markdown("---")
+    st.subheader("Analyze your tickers")
 
     with st.sidebar:
         st.subheader("Watchlist groups")

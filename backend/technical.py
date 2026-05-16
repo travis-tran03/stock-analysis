@@ -27,6 +27,7 @@ class TechnicalSnapshot:
     s1: Optional[float]
     support: Optional[float]
     resistance: Optional[float]
+    momentum_3m_pct: Optional[float]
     raw_row: dict[str, Any]
 
 
@@ -82,6 +83,34 @@ def _classic_pivots(prev_high: float, prev_low: float, prev_close: float) -> dic
     return {"pivot": p, "r1": r1, "s1": s1}
 
 
+def _momentum_3m_pct(close: pd.Series, lookback: int = 63) -> Optional[float]:
+    """Trailing ~3-month price return as a percent (e.g. 12.5 = +12.5%)."""
+    if len(close) < lookback + 1:
+        return None
+    past = float(close.iloc[-(lookback + 1)])
+    last = float(close.iloc[-1])
+    if past <= 0:
+        return None
+    return round((last / past - 1.0) * 100.0, 4)
+
+
+def momentum_score_3m(pct: Optional[float]) -> float:
+    """Map 3-month return to [-1, 1] for short-term ranking boost."""
+    if pct is None:
+        return 0.0
+    if pct >= 25:
+        return 0.45
+    if pct >= 12:
+        return 0.30
+    if pct >= 5:
+        return 0.15
+    if pct <= -20:
+        return -0.40
+    if pct <= -8:
+        return -0.20
+    return 0.0
+
+
 def _swing_support_resistance(
     high: pd.Series, low: pd.Series, lookback: int = 20
 ) -> tuple[Optional[float], Optional[float]]:
@@ -135,6 +164,7 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
         pivot, r1, s1 = piv["pivot"], piv["r1"], piv["s1"]
 
     sup, res = _swing_support_resistance(high, low, lookback=20)
+    mom_3m = _momentum_3m_pct(close)
 
     raw_row = {
         "rsi_14": rsi_14,
@@ -152,6 +182,7 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
         "last_close": last_close,
         "prior_close": prior_close,
         "change_1d_pct": change_1d_pct,
+        "momentum_3m_pct": mom_3m,
     }
 
     return TechnicalSnapshot(
@@ -168,6 +199,7 @@ def compute_technicals(df: pd.DataFrame) -> TechnicalSnapshot:
         s1=s1,
         support=sup,
         resistance=res,
+        momentum_3m_pct=mom_3m,
         raw_row=raw_row,
     )
 
@@ -214,8 +246,13 @@ def technical_score(tech: TechnicalSnapshot) -> float:
         weights.append(1.0)
 
     if not parts:
-        return 0.0
+        base = 0.0
+    else:
+        w = np.array(weights, dtype=float)
+        p = np.array(parts, dtype=float)
+        base = float(np.dot(p, w) / w.sum())
 
-    w = np.array(weights, dtype=float)
-    p = np.array(parts, dtype=float)
-    return float(np.dot(p, w) / w.sum())
+    mom = momentum_score_3m(tech.momentum_3m_pct)
+    if mom == 0.0 and base == 0.0:
+        return 0.0
+    return float(np.clip(0.85 * base + 0.15 * mom, -1.0, 1.0))

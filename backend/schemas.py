@@ -73,3 +73,30 @@ class StockAnalysis(BaseModel):
 class AnalyzeResponse(BaseModel):
     results: list[StockAnalysis]
     errors: list[str] = Field(default_factory=list)
+
+
+class RecommendationsRequest(BaseModel):
+    horizon: str = Field(..., description="'long' or 'short'")
+    top_n: int = Field(default=10, ge=1, le=50)
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_rr: Optional[float] = Field(default=None, ge=0.0)
+
+
+class RecommendationPick(BaseModel):
+    ticker: str
+    direction: str
+    horizon_score: float
+    confidence: float
+    rank_score: float
+    analysis: StockAnalysis
+
+
+class RecommendationsResponse(BaseModel):
+    horizon: str
+    top_n: int
+    scanned_count: int
+    universe_size: int
+    picks: list[RecommendationPick]
+    errors: list[str] = Field(default_factory=list)
+    as_of: str = ""
+    cancelled: bool = False
