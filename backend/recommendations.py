@@ -11,7 +11,7 @@ from backend.data_fetch import fetch_stock_data
 from backend.schemas import RecommendationPick, RecommendationsResponse, StockAnalysis
 from backend.scoring_profiles import Horizon
 from backend.signals import build_stock_analysis
-from backend.universe import get_universe, passes_large_cap_liquidity_filter
+from backend.universe import get_universe_with_info, passes_large_cap_liquidity_filter
 
 THROTTLE_SECONDS = 0.4
 SCORE_KEY: dict[Horizon, str] = {"long": "long_term", "short": "short_term"}
@@ -87,6 +87,8 @@ def finalize_recommendations(
     scanned_count: int,
     *,
     cancelled: bool = False,
+    universe_source: str = "",
+    universe_source_message: str = "",
 ) -> RecommendationsResponse:
     candidates.sort(key=lambda x: x[0], reverse=True)
     picks: list[RecommendationPick] = []
@@ -111,6 +113,8 @@ def finalize_recommendations(
         errors=errors,
         as_of=datetime.now(timezone.utc).isoformat(),
         cancelled=cancelled,
+        universe_source=universe_source,
+        universe_source_message=universe_source_message,
     )
 
 
@@ -125,8 +129,10 @@ def run_recommendations(
     """
     Scan universe, score each ticker, return top BUY picks for the horizon.
   """
-    tickers = get_universe(horizon)
+    universe = get_universe_with_info(horizon)
+    tickers = universe.tickers
     total = len(tickers)
+    u_src, u_msg = universe.source, universe.message
     scanned = 0
     errors: list[str] = []
     candidates: list[tuple[float, StockAnalysis]] = []
@@ -141,6 +147,8 @@ def run_recommendations(
                 errors + ["Scan stopped by user."],
                 scanned,
                 cancelled=True,
+                universe_source=u_src,
+                universe_source_message=u_msg,
             )
         if progress_callback:
             progress_callback(i, total, ticker)
@@ -156,5 +164,13 @@ def run_recommendations(
         time.sleep(THROTTLE_SECONDS)
 
     return finalize_recommendations(
-        horizon, top_n, total, candidates, errors, scanned, cancelled=False
+        horizon,
+        top_n,
+        total,
+        candidates,
+        errors,
+        scanned,
+        cancelled=False,
+        universe_source=u_src,
+        universe_source_message=u_msg,
     )

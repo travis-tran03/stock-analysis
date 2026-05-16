@@ -6,14 +6,18 @@ import json
 import logging
 import time
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 import pandas as pd
 
 from backend.data_fetch import normalize_ticker, validate_ticker_symbol
 from backend.index_constituents import (
+    IndexUniverseBuildResult,
     build_major_index_universe,
+    build_major_index_universe_with_info,
     major_index_universe_summary,
+    peek_index_universe_provenance,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,13 @@ DEFAULT_SHORT_SCAN_SIZE = 200
 _DOWNLOAD_CHUNK = 60
 
 
+@dataclass
+class UniverseBuildInfo:
+    tickers: list[str]
+    message: str
+    source: str = ""
+
+
 def _load_ticker_file(path: Path) -> list[str]:
     if not path.exists():
         return []
@@ -49,15 +60,20 @@ def _load_ticker_file(path: Path) -> list[str]:
     return out
 
 
+def load_large_cap_universe_with_info(*, force_refresh: bool = False) -> UniverseBuildInfo:
+    """US major index constituents with provenance message."""
+    result: IndexUniverseBuildResult = build_major_index_universe_with_info(
+        force_refresh=force_refresh
+    )
+    return UniverseBuildInfo(
+        tickers=result.tickers,
+        message=result.message,
+        source=result.source,
+    )
+
+
 def load_large_cap_universe(*, force_refresh: bool = False) -> list[str]:
-    """
-    US major index constituents (merged, deduped):
-    S&P 500, S&P 400, S&P 600, NASDAQ-100, Dow Jones Industrial Average.
-    """
-    tickers = build_major_index_universe(force_refresh=force_refresh)
-    if tickers:
-        return tickers
-    return _load_ticker_file(LARGE_CAP_FILE)
+    return load_large_cap_universe_with_info(force_refresh=force_refresh).tickers
 
 
 def _composite_momentum_score(close: pd.Series) -> Optional[float]:
@@ -204,11 +220,11 @@ def _write_short_term_cache(tickers: list[str], index_count: int) -> None:
     )
 
 
-def load_short_term_index_universe(
+def load_short_term_index_universe_with_info(
     max_symbols: int = DEFAULT_SHORT_SCAN_SIZE,
     *,
     force_refresh: bool = False,
-) -> list[str]:
+) -> UniverseBuildInfo:
     """
     Same major indexes as long-term, narrowed to names with the strongest
     short-term price momentum (1–3 month) before full scoring.
@@ -216,19 +232,52 @@ def load_short_term_index_universe(
     if not force_refresh and _short_term_cache_fresh():
         cached = _load_ticker_file(SHORT_TERM_CANDIDATES_FILE)
         if cached:
-            return cached[:max_symbols]
+            tickers = cached[:max_symbols]
+            return UniverseBuildInfo(
+                tickers=tickers,
+                source="short_momentum_cache",
+                message=(
+                    f"Using cached short-term momentum list ({len(tickers)} symbols, built within 24h)."
+                ),
+            )
 
-    pool = load_large_cap_universe()
+    index_info = load_large_cap_universe_with_info(force_refresh=force_refresh)
+    pool = index_info.tickers
     if not pool:
-        return []
+        return UniverseBuildInfo(tickers=[], message="No index symbols available.", source="empty")
 
     candidates = _rank_index_by_short_term_momentum(pool, max_symbols=max_symbols)
     if candidates:
         _write_short_term_cache(candidates, index_count=len(pool))
-        return candidates
+        return UniverseBuildInfo(
+            tickers=candidates,
+            source=index_info.source,
+            message=(
+                f"{index_info.message} "
+                f"Then selected top {len(candidates)} by 1–3 month price momentum for this scan."
+            ),
+        )
 
     logger.warning("Short-term momentum rank failed; using index pool slice")
-    return pool[:max_symbols]
+    slice_ = pool[:max_symbols]
+    return UniverseBuildInfo(
+        tickers=slice_,
+        source=index_info.source,
+        message=(
+            f"{index_info.message} Momentum ranking failed; using first {len(slice_)} "
+            "symbols from the index list."
+        ),
+    )
+
+
+def load_short_term_index_universe(
+    max_symbols: int = DEFAULT_SHORT_SCAN_SIZE,
+    *,
+    force_refresh: bool = False,
+) -> list[str]:
+    return load_short_term_index_universe_with_info(
+        max_symbols=max_symbols, force_refresh=force_refresh
+    ).tickers
 
 
 def short_term_universe_summary() -> str:
@@ -249,10 +298,16 @@ def short_term_universe_summary() -> str:
     )
 
 
-def get_universe(horizon: Horizon, max_short: int = DEFAULT_SHORT_SCAN_SIZE) -> list[str]:
+def get_universe_with_info(
+    horizon: Horizon, max_short: int = DEFAULT_SHORT_SCAN_SIZE
+) -> UniverseBuildInfo:
     if horizon == "long":
-        return load_large_cap_universe()
-    return load_short_term_index_universe(max_symbols=max_short)
+        return load_large_cap_universe_with_info()
+    return load_short_term_index_universe_with_info(max_symbols=max_short)
+
+
+def get_universe(horizon: Horizon, max_short: int = DEFAULT_SHORT_SCAN_SIZE) -> list[str]:
+    return get_universe_with_info(horizon, max_short=max_short).tickers
 
 
 def passes_large_cap_liquidity_filter(info: dict) -> bool:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,6 +37,30 @@ MAJOR_INDEX_SOURCES: list[tuple[str, str]] = [
 ]
 
 _SYMBOL_COLUMNS = ("Symbol", "Ticker", "Company Ticker")
+
+# wikipedia_fresh | cache_fresh | cache_stale | bundled_fallback
+SOURCE_WIKIPEDIA_FRESH = "wikipedia_fresh"
+SOURCE_CACHE_FRESH = "cache_fresh"
+SOURCE_CACHE_STALE = "cache_stale"
+SOURCE_BUNDLED_FALLBACK = "bundled_fallback"
+
+
+@dataclass
+class IndexUniverseBuildResult:
+    tickers: list[str]
+    source: str
+    message: str
+    built_at: Optional[float] = None
+    symbol_count: int = 0
+
+
+def _format_built_at(ts: Optional[float]) -> str:
+    if ts is None:
+        return "unknown date"
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (OSError, OverflowError, ValueError):
+        return "unknown date"
 
 
 def _normalize_wiki_symbol(raw: str) -> str:
@@ -128,15 +154,29 @@ def _write_merged_cache(tickers: list[str], sources: dict[str, int]) -> None:
     )
 
 
-def build_major_index_universe(*, force_refresh: bool = False) -> list[str]:
+def build_major_index_universe_with_info(
+    *, force_refresh: bool = False
+) -> IndexUniverseBuildResult:
     """
     Merge constituents from major US equity indexes:
     S&P 500, S&P MidCap 400, S&P SmallCap 600, NASDAQ-100, Dow Jones Industrial Average.
     """
+    meta = _read_cache_meta()
+
     if not force_refresh:
         cached = _load_ticker_file(MERGED_CACHE_FILE)
         if cached and _cache_is_fresh():
-            return cached
+            built = float(meta["built_at"]) if meta and meta.get("built_at") else None
+            return IndexUniverseBuildResult(
+                tickers=cached,
+                source=SOURCE_CACHE_FRESH,
+                built_at=built,
+                symbol_count=len(cached),
+                message=(
+                    f"Using on-disk index list ({len(cached)} symbols, last built "
+                    f"{_format_built_at(built)}). Wikipedia was not called (cache still fresh)."
+                ),
+            )
 
     seen: set[str] = set()
     merged: list[str] = []
@@ -152,20 +192,78 @@ def build_major_index_universe(*, force_refresh: bool = False) -> list[str]:
 
     if merged:
         _write_merged_cache(merged, sources)
+        built = time.time()
         logger.info(
             "Built major-index universe: %d symbols (%s)",
             len(merged),
             ", ".join(f"{k}={v}" for k, v in sources.items()),
         )
-        return merged
+        return IndexUniverseBuildResult(
+            tickers=merged,
+            source=SOURCE_WIKIPEDIA_FRESH,
+            built_at=built,
+            symbol_count=len(merged),
+            message=(
+                f"Fetched fresh index constituents from Wikipedia ({len(merged)} symbols, "
+                f"{_format_built_at(built)})."
+            ),
+        )
 
     stale = _load_ticker_file(MERGED_CACHE_FILE)
     if stale:
+        built = float(meta["built_at"]) if meta and meta.get("built_at") else None
         logger.warning("Major-index fetch failed; using existing merged cache (%d symbols)", len(stale))
-        return stale
+        return IndexUniverseBuildResult(
+            tickers=stale,
+            source=SOURCE_CACHE_STALE,
+            built_at=built,
+            symbol_count=len(stale),
+            message=(
+                f"Wikipedia fetch failed; using bundled/cached merged index list ({len(stale)} symbols, "
+                f"file dated {_format_built_at(built)})."
+            ),
+        )
 
+    fallback = _load_ticker_file(FALLBACK_FILE)
     logger.warning("Major-index fetch produced no symbols; using bundled fallback list")
-    return _load_ticker_file(FALLBACK_FILE)
+    return IndexUniverseBuildResult(
+        tickers=fallback,
+        source=SOURCE_BUNDLED_FALLBACK,
+        symbol_count=len(fallback),
+        message=(
+            f"Index fetch failed; using small bundled fallback list ({len(fallback)} symbols from "
+            f"{FALLBACK_FILE.name})."
+        ),
+    )
+
+
+def build_major_index_universe(*, force_refresh: bool = False) -> list[str]:
+    return build_major_index_universe_with_info(force_refresh=force_refresh).tickers
+
+
+def peek_index_universe_provenance() -> str:
+    """Fast hint (no Wikipedia) for what list the next long scan would likely use."""
+    meta = _read_cache_meta()
+    merged = _load_ticker_file(MERGED_CACHE_FILE)
+    if merged and _cache_is_fresh():
+        built = float(meta["built_at"]) if meta and meta.get("built_at") else None
+        return (
+            f"Likely source: fresh on-disk cache ({len(merged)} symbols, "
+            f"{_format_built_at(built)})."
+        )
+    if merged:
+        built = float(meta["built_at"]) if meta and meta.get("built_at") else None
+        return (
+            f"Likely source: merged list in app ({len(merged)} symbols, "
+            f"{_format_built_at(built)}). Scan will try Wikipedia first."
+        )
+    fallback = _load_ticker_file(FALLBACK_FILE)
+    if fallback:
+        return (
+            f"No merged list on disk. Scan will try Wikipedia, or fall back to "
+            f"{len(fallback)} symbols in {FALLBACK_FILE.name}."
+        )
+    return "Scan will try Wikipedia for index constituents."
 
 
 def major_index_universe_summary() -> str:

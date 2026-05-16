@@ -100,3 +100,5 @@ class RecommendationsResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
     as_of: str = ""
     cancelled: bool = False
+    universe_source: str = ""
+    universe_source_message: str = ""

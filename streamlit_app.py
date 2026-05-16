@@ -12,13 +12,20 @@ import streamlit as st
 from supabase import Client, create_client
 
 from backend.analysis_runner import run_analyze
-from backend.index_constituents import major_index_universe_summary
+from backend.index_constituents import (
+    SOURCE_BUNDLED_FALLBACK,
+    SOURCE_CACHE_FRESH,
+    SOURCE_CACHE_STALE,
+    SOURCE_WIKIPEDIA_FRESH,
+    major_index_universe_summary,
+    peek_index_universe_provenance,
+)
 from backend.recommendations import (
     finalize_recommendations,
     process_ticker_for_recommendations,
 )
 from backend.schemas import RecommendationsResponse, StockAnalysis
-from backend.universe import get_universe, load_large_cap_universe, short_term_universe_summary
+from backend.universe import get_universe_with_info, short_term_universe_summary
 
 REC_SCAN_STATE_KEY = "recommendation_scan"
 REC_SCAN_STOP_KEY = "recommendation_scan_stop"
@@ -415,6 +422,20 @@ def save_recommendations_to_supabase(
     ).execute()
 
 
+def _show_universe_source_banner(message: str, source: str = "") -> None:
+    """Surface whether the scan used Wikipedia, cached merged file, or fallback list."""
+    if not message:
+        return
+    if source == SOURCE_WIKIPEDIA_FRESH:
+        st.success(message)
+    elif source == SOURCE_CACHE_FRESH:
+        st.info(message)
+    elif source in (SOURCE_CACHE_STALE, SOURCE_BUNDLED_FALLBACK):
+        st.warning(message)
+    else:
+        st.info(message)
+
+
 def build_recommendations_dataframe(
     picks: list[dict[str, Any]], score_label: str
 ) -> pd.DataFrame:
@@ -459,6 +480,8 @@ def _complete_recommendation_scan(
         errors=list(state.get("errors") or []),
         scanned_count=int(state.get("scanned") or 0),
         cancelled=cancelled,
+        universe_source=str(state.get("universe_source") or ""),
+        universe_source_message=str(state.get("universe_source_message") or ""),
     )
     if cancelled:
         response.errors = list(response.errors) + ["Scan stopped by user."]
@@ -520,9 +543,11 @@ def _handle_active_recommendation_scan(supabase_client: Optional[Client]) -> Non
 
     if state.get("phase") == "universe":
         with st.spinner(f"Building universe for {title}…"):
-            tickers = get_universe(horizon)  # type: ignore[arg-type]
-        state["tickers"] = tickers
-        state["universe_size"] = len(tickers)
+            built = get_universe_with_info(horizon)  # type: ignore[arg-type]
+        state["tickers"] = built.tickers
+        state["universe_size"] = len(built.tickers)
+        state["universe_source"] = built.source
+        state["universe_source_message"] = built.message
         state["phase"] = "scan"
         st.rerun()
         return
@@ -567,6 +592,11 @@ def _render_active_scan_controls() -> bool:
     i = int(state.get("i") or 0)
 
     st.markdown(f"**Scan in progress:** {title}")
+    if state.get("universe_source_message"):
+        _show_universe_source_banner(
+            str(state["universe_source_message"]),
+            str(state.get("universe_source") or ""),
+        )
     if phase == "universe":
         st.progress(0.0, text="Building ticker universe…")
     else:
@@ -602,6 +632,11 @@ def _render_recommendation_block(
             f"Last scan: {as_of} — scanned {cached.get('scanned_count', '?')} of "
             f"{cached.get('universe_size', '?')}{stopped}"
         )
+        if cached.get("universe_source_message"):
+            _show_universe_source_banner(
+                str(cached["universe_source_message"]),
+                str(cached.get("universe_source") or ""),
+            )
 
     scan_active = st.session_state.get(REC_SCAN_STATE_KEY) is not None
     this_scan = (
@@ -737,16 +772,16 @@ def main() -> None:
     col_long, col_short = st.columns(2)
     with col_long:
         try:
-            long_universe_n = len(load_large_cap_universe())
             long_universe_desc = major_index_universe_summary()
+            long_provenance = peek_index_universe_provenance()
         except Exception:
-            long_universe_n = "?"
             long_universe_desc = "S&P 500, S&P 400, S&P 600, NASDAQ-100, Dow 30"
+            long_provenance = ""
         _render_recommendation_block(
             horizon="long",
             title="Long-term growth",
             caption=(
-                f"Universe: {long_universe_desc} — {long_universe_n} symbols to scan. "
+                f"Universe: {long_universe_desc}. {long_provenance} "
                 "Scores favor fundamentals and market regime."
             ),
             score_label="Long score",
